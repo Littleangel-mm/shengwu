@@ -1,9 +1,12 @@
+import hashlib
+import hmac
 import io
 import platform
 import warnings
 from collections import defaultdict
 from collections.abc import Callable
 from importlib.metadata import version as package_version
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -908,10 +911,36 @@ class MLService:
                 code="ml_model_not_found", message="模型不存在或尚未生成", status_code=404
             )
         stored = self.db.get(StoredFile, row["artifact_file_id"])
-        if not stored:
+        if not stored or stored.project_id != project_id or stored.deleted_at is not None:
             raise AppError(code="ml_artifact_not_found", message="模型文件不存在", status_code=404)
-        artifact = joblib.load(self.storage.path_for_key(stored.storage_key))
+        artifact_path = self.storage.path_for_key(stored.storage_key)
+        if not artifact_path.is_file():
+            raise AppError(code="ml_artifact_not_found", message="模型文件不存在", status_code=404)
+        stored_hash = stored.sha256
+        model_hash = row["artifact_sha256"]
+        if not stored_hash or not model_hash or not hmac.compare_digest(stored_hash, model_hash):
+            raise AppError(
+                code="ml_artifact_integrity_failed",
+                message="模型文件完整性校验失败",
+                status_code=409,
+            )
+        actual_hash = self._file_sha256(artifact_path)
+        if not hmac.compare_digest(actual_hash, model_hash):
+            raise AppError(
+                code="ml_artifact_integrity_failed",
+                message="模型文件完整性校验失败",
+                status_code=409,
+            )
+        artifact = joblib.load(artifact_path)
         return dict(row), artifact
+
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest()
 
     @staticmethod
     def _predict_with_uncertainty(

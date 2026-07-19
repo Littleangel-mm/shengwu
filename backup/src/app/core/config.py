@@ -1,5 +1,6 @@
 from functools import lru_cache
 from pathlib import Path
+from uuid import UUID
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -24,7 +25,11 @@ class Settings(BaseSettings):
     docs_enabled: bool = True
     app_secret: SecretStr = SecretStr("development-only-change-me")
     access_token_expire_minutes: int = Field(default=720, ge=5, le=43200)
-    allow_actor_header: bool = True
+    allow_actor_header: bool = False
+    platform_admin_user_ids: str = ""
+    login_max_failures: int = Field(default=5, ge=2, le=100)
+    login_attempt_window_minutes: int = Field(default=15, ge=1, le=1440)
+    login_lock_minutes: int = Field(default=15, ge=1, le=1440)
 
     db_host: str = "127.0.0.1"
     db_port: int = 5432
@@ -62,6 +67,11 @@ class Settings(BaseSettings):
         value = "/" + value.strip("/")
         return value.rstrip("/")
 
+    @field_validator("platform_admin_user_ids")
+    @classmethod
+    def normalize_platform_admin_ids(cls, value: str) -> str:
+        return ",".join(str(UUID(item.strip())) for item in value.split(",") if item.strip())
+
     @property
     def database_url(self) -> URL:
         return URL.create(
@@ -89,13 +99,26 @@ class Settings(BaseSettings):
     def max_upload_size_bytes(self) -> int:
         return self.max_upload_size_mb * 1024 * 1024
 
+    @property
+    def is_production(self) -> bool:
+        return self.app_env.strip().casefold() in {"production", "prod"}
+
+    @property
+    def platform_admin_user_id_set(self) -> set[UUID]:
+        return {
+            UUID(item.strip()) for item in self.platform_admin_user_ids.split(",") if item.strip()
+        }
+
     @model_validator(mode="after")
     def validate_production_secret(self) -> "Settings":
-        if (
-            self.app_env.lower() == "production"
-            and self.app_secret.get_secret_value() == "development-only-change-me"
-        ):
-            raise ValueError("APP_SECRET must be configured in production")
+        if self.is_production:
+            if self.app_secret.get_secret_value() in {
+                "development-only-change-me",
+                "change-this-to-a-long-random-secret",
+            }:
+                raise ValueError("APP_SECRET must be configured in production")
+            if self.allow_actor_header:
+                raise ValueError("ALLOW_ACTOR_HEADER must be false in production")
         return self
 
 

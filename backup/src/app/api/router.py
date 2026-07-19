@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends
 
-from app.api.deps import require_project_member
+from app.api.deps import require_project_access
 from app.api.v1 import (
     auth,
     datasets,
@@ -22,7 +22,7 @@ api_router.include_router(auth.router, tags=["认证"])
 api_router.include_router(health.router, tags=["健康检查"])
 api_router.include_router(organizations.router, prefix="/organizations", tags=["组织"])
 api_router.include_router(projects.router, prefix="/projects", tags=["项目"])
-project_dependencies = [Depends(require_project_member)]
+project_dependencies = [Depends(require_project_access)]
 api_router.include_router(
     documents.router, prefix="/projects", tags=["文献"], dependencies=project_dependencies
 )

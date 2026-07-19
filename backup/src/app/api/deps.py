@@ -2,7 +2,7 @@ from collections.abc import Generator
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import Depends, Header
+from fastapi import Depends, Header, Request
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
@@ -37,7 +37,8 @@ def get_actor_id(
         return parse_access_token(token)
     if not x_actor_id:
         return None
-    if not get_settings().allow_actor_header:
+    settings = get_settings()
+    if settings.is_production or not settings.allow_actor_header:
         raise AppError(
             code="actor_header_disabled",
             message="当前环境不允许 X-Actor-ID",
@@ -105,6 +106,24 @@ def _project_role(
     return row.project_role, row.organization_role
 
 
+def _organization_role(db: Session, organization_id: UUID, actor_id: UUID) -> str | None:
+    organizations = table(db, "organizations")
+    organization_members = table(db, "organization_members")
+    return db.scalar(
+        select(organization_members.c.role)
+        .join(
+            organizations,
+            organizations.c.id == organization_members.c.organization_id,
+        )
+        .where(
+            organizations.c.id == organization_id,
+            organizations.c.deleted_at.is_(None),
+            organization_members.c.user_id == actor_id,
+            organization_members.c.status == "active",
+        )
+    )
+
+
 def require_project_member(
     project_id: UUID,
     db: DbSession,
@@ -130,5 +149,68 @@ def require_project_editor(
     return actor_id
 
 
+def require_project_access(
+    request: Request,
+    project_id: UUID,
+    db: DbSession,
+    actor_id: CurrentActorId,
+) -> UUID:
+    if request.method in {"GET", "HEAD", "OPTIONS"}:
+        return require_project_member(project_id, db, actor_id)
+    return require_project_editor(project_id, db, actor_id)
+
+
+def require_organization_member(
+    organization_id: UUID,
+    db: DbSession,
+    actor_id: CurrentActorId,
+) -> UUID:
+    if not _organization_role(db, organization_id, actor_id):
+        raise AppError(code="organization_not_found", message="组织不存在", status_code=404)
+    return actor_id
+
+
+def require_organization_admin(
+    organization_id: UUID,
+    db: DbSession,
+    actor_id: CurrentActorId,
+) -> UUID:
+    role = _organization_role(db, organization_id, actor_id)
+    if not role:
+        raise AppError(code="organization_not_found", message="组织不存在", status_code=404)
+    if role not in {"owner", "admin"}:
+        raise AppError(
+            code="organization_admin_required",
+            message="需要组织管理员权限",
+            status_code=403,
+        )
+    return actor_id
+
+
+def require_platform_admin(actor_id: CurrentActorId) -> UUID:
+    if actor_id not in get_settings().platform_admin_user_id_set:
+        raise AppError(
+            code="platform_admin_required",
+            message="需要平台管理员权限",
+            status_code=403,
+        )
+    return actor_id
+
+
+def authorize_conversion_rule_write(
+    db: DbSession,
+    actor_id: CurrentActorId,
+    organization_id: UUID | None = None,
+) -> UUID:
+    if organization_id is None:
+        return require_platform_admin(actor_id)
+    return require_organization_admin(organization_id, db, actor_id)
+
+
 ProjectMember = Annotated[UUID, Depends(require_project_member)]
 ProjectEditor = Annotated[UUID, Depends(require_project_editor)]
+ProjectAccess = Annotated[UUID, Depends(require_project_access)]
+OrganizationMember = Annotated[UUID, Depends(require_organization_member)]
+OrganizationAdmin = Annotated[UUID, Depends(require_organization_admin)]
+PlatformAdmin = Annotated[UUID, Depends(require_platform_admin)]
+ConversionRuleAdmin = Annotated[UUID, Depends(authorize_conversion_rule_write)]

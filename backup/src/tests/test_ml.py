@@ -1,3 +1,5 @@
+import hashlib
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -49,3 +51,9 @@ def test_model_parameters_are_valid_json_values() -> None:
         "missing": None,
         "learning_rate": 0.1,
     }
+
+
+def test_model_artifact_hash_is_computed_from_file(tmp_path) -> None:
+    artifact = tmp_path / "model.joblib"
+    artifact.write_bytes(b"trusted model artifact")
+    assert MLService._file_sha256(artifact) == hashlib.sha256(b"trusted model artifact").hexdigest()

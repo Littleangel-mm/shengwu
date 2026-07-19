@@ -71,8 +71,13 @@ the Paddle 3.3 oneDNN/PIR incompatibility. This is slower than GPU inference but
 
 ## Security and machine learning
 
-- All project-scoped APIs require a valid access token and enforce project or organization membership.
-- Production must set a persistent `APP_SECRET` and set `ALLOW_ACTOR_HEADER=false`.
+- All project-scoped APIs require a valid access token. Viewers are read-only; editors, project
+  owners and organization administrators can mutate project resources.
+- Production must set a persistent `APP_SECRET`; startup rejects `ALLOW_ACTOR_HEADER=true`.
+- Global unit and conversion-rule writes require an actor listed in `PLATFORM_ADMIN_USER_IDS`.
+  Organization-scoped service configuration requires an organization administrator.
+- Failed logins are throttled in PostgreSQL by normalized account and client address.
+- Serialized model artifacts are SHA-256 verified against both model and file records before load.
 - Training supports mixed numeric/categorical inputs, configurable imputers and scalers, grouped train/test splits, grouped cross-validation and bounded parameter search.
 - Regression models: Ridge, PLS, SVR, Random Forest, Gradient Boosting and XGBoost.
 - Classification models: Logistic Regression, SVC, Random Forest, Gradient Boosting and XGBoost.

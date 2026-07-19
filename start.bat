@@ -65,20 +65,7 @@ if not exist "%ENV_FILE%" (
     )
     copy /Y "%ENV_EXAMPLE%" "%ENV_FILE%" >nul
     powershell -NoProfile -ExecutionPolicy Bypass -Command "$p='%ENV_FILE%'; $s=[Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(48)); $c=[IO.File]::ReadAllText($p); $c=$c.Replace('change-this-to-a-long-random-secret',$s); [IO.File]::WriteAllText($p,$c,[Text.UTF8Encoding]::new($false))" >nul 2>&1
-    echo [ACTION] A local .env file was created with a random APP_SECRET.
-    echo [ACTION] Fill in the database settings, close Notepad, then run start.bat again.
-    start "Shengwu configuration" notepad.exe "%ENV_FILE%"
-    popd
-    goto :configuration_required
-)
-
-findstr /B /C:"DB_PASSWORD=change-me" "%ENV_FILE%" >nul 2>&1
-if not errorlevel 1 (
-    echo [ACTION] DB_PASSWORD is still a placeholder in "%ENV_FILE%".
-    echo [ACTION] Complete the database settings, then run start.bat again.
-    start "Shengwu configuration" notepad.exe "%ENV_FILE%"
-    popd
-    goto :configuration_required
+    echo [INFO] A local .env file was created for the backend.
 )
 
 if not exist "models\paddleocr\PP-OCRv5_mobile_det" echo [WARN] OCR detection model directory is missing.
@@ -182,11 +169,6 @@ exit /b %errorlevel%
 :worker_running
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$p=Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match '(?i)(^|\s)-m\s+app\.worker(\s|$)' }; if ($p) { exit 0 } else { exit 1 }" >nul 2>&1
 exit /b %errorlevel%
-
-:configuration_required
-echo [INFO] Configuration is required before the first start.
-pause
-exit /b 2
 
 :failed
 echo.

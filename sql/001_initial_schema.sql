@@ -82,6 +82,19 @@ CREATE TABLE app_users (
     CONSTRAINT uq_app_users_external_subject UNIQUE (auth_provider, external_subject)
 );
 
+CREATE TABLE auth_login_attempts (
+    key_hash                 char(64) PRIMARY KEY,
+    failed_count             integer NOT NULL DEFAULT 0 CHECK (failed_count >= 0),
+    window_started_at        timestamptz NOT NULL DEFAULT now(),
+    blocked_until            timestamptz,
+    updated_at               timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT ck_auth_login_attempts_key CHECK (key_hash ~ '^[0-9a-f]{64}$')
+);
+
+CREATE INDEX ix_auth_login_attempts_blocked_until
+    ON auth_login_attempts(blocked_until)
+    WHERE blocked_until IS NOT NULL;
+
 CREATE TABLE organizations (
     id                       uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     name                     varchar(200) NOT NULL,

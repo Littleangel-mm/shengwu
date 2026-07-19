@@ -12,6 +12,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def test_complete_backend_workflow() -> None:
+    from app.core.config import get_settings
     from app.main import app
 
     client = TestClient(app)
@@ -36,6 +37,7 @@ def test_complete_backend_workflow() -> None:
         201,
     )
     headers = {"Authorization": f"Bearer {owner['access_token']}"}
+    get_settings().platform_admin_user_ids = owner["user"]["id"]
     checked(client.get("/api/v1/auth/me", headers=headers))
     organization = checked(
         client.post(
@@ -58,6 +60,18 @@ def test_complete_backend_workflow() -> None:
         201,
     )
     project_id = project["id"]
+    other_project = checked(
+        client.post(
+            "/api/v1/projects",
+            headers=headers,
+            json={
+                "organization_id": organization["id"],
+                "name": "Report Isolation Target",
+                "research_domain": "security validation",
+            },
+        ),
+        201,
+    )
     checked(client.get("/api/v1/organizations", headers=headers))
     checked(client.get("/api/v1/projects", headers=headers))
     checked(
@@ -68,6 +82,7 @@ def test_complete_backend_workflow() -> None:
     source_unit = checked(
         client.post(
             "/api/v1/units",
+            headers=headers,
             json={
                 "code": "integration_celsius",
                 "symbol": "iC",
@@ -80,6 +95,7 @@ def test_complete_backend_workflow() -> None:
     target_unit = checked(
         client.post(
             "/api/v1/units",
+            headers=headers,
             json={
                 "code": "integration_kelvin",
                 "symbol": "iK",
@@ -106,11 +122,12 @@ def test_complete_backend_workflow() -> None:
     converted = checked(
         client.post(
             "/api/v1/convert",
+            headers=headers,
             json={"rule_id": conversion_rule["id"], "value": 25, "confirmed": True},
         )
     )
     assert converted["target_value"] == pytest.approx(298.15)
-    checked(client.get("/api/v1/units"))
+    checked(client.get("/api/v1/units", headers=headers))
     checked(
         client.post(
             f"/api/v1/organizations/{organization['id']}/external-services",
@@ -141,6 +158,13 @@ def test_complete_backend_workflow() -> None:
     )
     outsider_headers = {"Authorization": f"Bearer {outsider['access_token']}"}
     assert client.get(f"/api/v1/projects/{project_id}", headers=outsider_headers).status_code == 404
+    assert (
+        client.get(
+            f"/api/v1/projects/{project_id}/audit-logs",
+            headers=outsider_headers,
+        ).status_code
+        == 404
+    )
 
     document_ids = []
     for index in range(8):
@@ -476,6 +500,17 @@ def test_complete_backend_workflow() -> None:
         ),
         202,
     )
+    cross_project_report = client.post(
+        f"/api/v1/projects/{other_project['id']}/reports",
+        headers=headers,
+        json={
+            "title": "Cross-project report must fail",
+            "dataset_version_id": dataset["resource_id"],
+            "ml_run_id": ml_run["resource_id"],
+            "optimization_run_id": optimization["resource_id"],
+        },
+    )
+    assert cross_project_report.status_code == 404
     checked(
         client.post(f"/api/v1/projects/{project_id}/jobs/{report['job_id']}/run", headers=headers)
     )

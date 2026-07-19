@@ -26,6 +26,12 @@ class ReportService:
     def create(
         self, project_id: UUID, payload: ReportCreate, actor_id: UUID | None
     ) -> TaskAccepted:
+        self._validate_source_scope(
+            project_id,
+            payload.dataset_version_id,
+            payload.ml_run_id,
+            payload.optimization_run_id,
+        )
         reports = table(self.db, "reports")
         version_no = (
             self.db.scalar(
@@ -64,6 +70,54 @@ class ReportService:
         self.db.add(job)
         self.db.commit()
         return TaskAccepted(resource_id=report_id, job_id=job.id)
+
+    def _validate_source_scope(
+        self,
+        project_id: UUID,
+        dataset_version_id: UUID,
+        ml_run_id: UUID | None,
+        optimization_run_id: UUID | None,
+    ) -> None:
+        datasets = table(self.db, "datasets")
+        versions = table(self.db, "dataset_versions")
+        dataset_project_id = self.db.scalar(
+            select(datasets.c.project_id)
+            .join(versions, versions.c.dataset_id == datasets.c.id)
+            .where(
+                versions.c.id == dataset_version_id,
+                datasets.c.deleted_at.is_(None),
+            )
+        )
+        if dataset_project_id != project_id:
+            raise AppError(
+                code="report_source_not_found",
+                message="报告数据源不存在",
+                status_code=404,
+            )
+
+        if ml_run_id is not None:
+            ml_runs = table(self.db, "ml_runs")
+            ml_project_id = self.db.scalar(
+                select(ml_runs.c.project_id).where(ml_runs.c.id == ml_run_id)
+            )
+            if ml_project_id != project_id:
+                raise AppError(
+                    code="report_source_not_found",
+                    message="报告数据源不存在",
+                    status_code=404,
+                )
+
+        if optimization_run_id is not None:
+            optimizations = table(self.db, "optimization_runs")
+            optimization_project_id = self.db.scalar(
+                select(optimizations.c.project_id).where(optimizations.c.id == optimization_run_id)
+            )
+            if optimization_project_id != project_id:
+                raise AppError(
+                    code="report_source_not_found",
+                    message="报告数据源不存在",
+                    status_code=404,
+                )
 
     def list(self, project_id: UUID) -> list[dict]:
         reports = table(self.db, "reports")
@@ -125,6 +179,12 @@ class ReportService:
         )
         if not report:
             raise AppError(code="report_not_found", message="报告任务不存在", status_code=404)
+        self._validate_source_scope(
+            report["project_id"],
+            report["dataset_version_id"],
+            report["ml_run_id"],
+            report["optimization_run_id"],
+        )
         self.db.execute(delete(report_assets).where(report_assets.c.report_id == report_id))
         project = self.db.get(Project, report["project_id"])
         if not project:

@@ -1,3 +1,4 @@
+from typing import Any
 from uuid import UUID
 
 from sqlalchemy import func, insert, select
@@ -16,6 +17,33 @@ from app.schemas.system import (
 class SystemService:
     def __init__(self, db: Session) -> None:
         self.db = db
+
+    @classmethod
+    def _redact_sensitive_configuration(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            redacted = {}
+            for key, item in value.items():
+                normalized = str(key).casefold().replace("-", "_")
+                if any(
+                    marker in normalized
+                    for marker in (
+                        "secret",
+                        "password",
+                        "token",
+                        "api_key",
+                        "apikey",
+                        "credential",
+                        "authorization",
+                        "private_key",
+                    )
+                ):
+                    redacted[key] = "***"
+                else:
+                    redacted[key] = cls._redact_sensitive_configuration(item)
+            return redacted
+        if isinstance(value, list):
+            return [cls._redact_sensitive_configuration(item) for item in value]
+        return value
 
     def list_units(self) -> list[dict]:
         units = table(self.db, "units")
@@ -51,7 +79,7 @@ class SystemService:
         return dict(row)
 
     def create_conversion_rule(
-        self, organization_id: UUID | None, payload: ConversionRuleCreate, actor_id: UUID | None
+        self, organization_id: UUID | None, payload: ConversionRuleCreate, actor_id: UUID
     ) -> dict:
         rules = table(self.db, "unit_conversion_rules")
         row = (
@@ -77,7 +105,7 @@ class SystemService:
         self.db.commit()
         return dict(row)
 
-    def convert(self, payload: ConvertValueRequest) -> dict:
+    def convert(self, payload: ConvertValueRequest, actor_id: UUID) -> dict:
         rules = table(self.db, "unit_conversion_rules")
         row = (
             self.db.execute(
@@ -90,6 +118,21 @@ class SystemService:
             raise AppError(
                 code="conversion_rule_not_found", message="换算规则不存在", status_code=404
             )
+        if row["organization_id"] is not None:
+            members = table(self.db, "organization_members")
+            membership = self.db.scalar(
+                select(members.c.id).where(
+                    members.c.organization_id == row["organization_id"],
+                    members.c.user_id == actor_id,
+                    members.c.status == "active",
+                )
+            )
+            if not membership:
+                raise AppError(
+                    code="conversion_rule_not_found",
+                    message="换算规则不存在",
+                    status_code=404,
+                )
         if row["requires_confirmation"] and not payload.confirmed:
             raise AppError(
                 code="conversion_requires_confirmation",
@@ -136,8 +179,9 @@ class SystemService:
         organization_id: UUID,
         project_id: UUID | None,
         payload: ExternalServiceCreate,
-        actor_id: UUID | None,
+        actor_id: UUID,
     ) -> dict:
+        self._validate_project_scope(organization_id, project_id)
         configs = table(self.db, "external_service_configs")
         row = (
             self.db.execute(
@@ -161,9 +205,13 @@ class SystemService:
         self.db.commit()
         result = dict(row)
         result["secret_reference"] = "***" if result.get("secret_reference") else None
+        result["configuration"] = self._redact_sensitive_configuration(
+            result.get("configuration", {})
+        )
         return result
 
     def list_external_services(self, organization_id: UUID, project_id: UUID | None) -> list[dict]:
+        self._validate_project_scope(organization_id, project_id)
         configs = table(self.db, "external_service_configs")
         filters = [configs.c.organization_id == organization_id]
         if project_id:
@@ -176,4 +224,21 @@ class SystemService:
         ]
         for row in rows:
             row["secret_reference"] = "***" if row.get("secret_reference") else None
+            row["configuration"] = self._redact_sensitive_configuration(
+                row.get("configuration", {})
+            )
         return rows
+
+    def _validate_project_scope(self, organization_id: UUID, project_id: UUID | None) -> None:
+        if project_id is None:
+            return
+        projects = table(self.db, "projects")
+        exists = self.db.scalar(
+            select(projects.c.id).where(
+                projects.c.id == project_id,
+                projects.c.organization_id == organization_id,
+                projects.c.deleted_at.is_(None),
+            )
+        )
+        if not exists:
+            raise AppError(code="project_not_found", message="项目不存在", status_code=404)

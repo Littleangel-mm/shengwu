@@ -28,6 +28,174 @@ from app.services.audit import AuditService
 from app.services.storage import LocalStorage
 
 
+def _has_dataset_value(cell: dict[str, Any] | None) -> bool:
+    if not cell or cell.get("is_missing"):
+        return False
+    value_columns = (
+        "raw_value",
+        "normalized_value",
+        "ml_value",
+        "value_text",
+        "value_number",
+        "value_boolean",
+        "value_date",
+        "value_json",
+        "range_min",
+        "range_max",
+        "mean_value",
+        "standard_deviation",
+        "significance_marker",
+    )
+    for column in value_columns:
+        value = cell.get(column)
+        if isinstance(value, str):
+            if value.strip():
+                return True
+        elif isinstance(value, (dict, list, tuple, set)):
+            if value:
+                return True
+        elif value is not None:
+            return True
+    return False
+
+
+def _freeze_issues(
+    fields: list[dict[str, Any]],
+    rows: list[dict[str, Any]],
+    cells: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    cells_by_position = {(cell["row_id"], cell["field_id"]): cell for cell in cells}
+    issues: list[dict[str, Any]] = []
+    for row in rows:
+        for field in fields:
+            cell = cells_by_position.get((row["id"], field["id"]))
+            context = {
+                "row_id": str(row["id"]),
+                "row_no": row["row_no"],
+                "row_key": row["row_key"],
+                "field_id": str(field["id"]),
+                "field_key": field["field_key"],
+                "display_name": field["display_name"],
+            }
+            if field["is_required"] and not _has_dataset_value(cell):
+                issues.append({"code": "required_value_missing", **context})
+            if cell and cell.get("review_status") == "doubtful":
+                issues.append(
+                    {
+                        "code": "doubtful_value",
+                        "cell_id": str(cell["id"]),
+                        **context,
+                    }
+                )
+    return issues
+
+
+def _freeze_snapshot(
+    fields: list[dict[str, Any]],
+    rows: list[dict[str, Any]],
+    cells: list[dict[str, Any]],
+    evidence: list[dict[str, Any]],
+) -> dict[str, Any]:
+    field_key = {field["id"]: field["field_key"] for field in fields}
+    row_key = {row["id"]: row["row_key"] for row in rows}
+    cell_position = {
+        cell["id"]: (row_key[cell["row_id"]], field_key[cell["field_id"]]) for cell in cells
+    }
+    field_columns = (
+        "field_key",
+        "display_name",
+        "data_type",
+        "semantic_role",
+        "unit_id",
+        "position",
+        "is_required",
+        "is_hidden",
+        "validation_rules",
+        "display_config",
+        "metadata",
+    )
+    row_columns = (
+        "row_no",
+        "row_key",
+        "source_document_id",
+        "source_document_version_id",
+        "source_sample_key",
+        "review_status",
+        "metadata",
+    )
+    cell_columns = (
+        "source_extraction_record_id",
+        "raw_value",
+        "raw_unit_text",
+        "normalized_value",
+        "ml_value",
+        "value_text",
+        "value_number",
+        "value_boolean",
+        "value_date",
+        "value_json",
+        "range_min",
+        "range_max",
+        "mean_value",
+        "standard_deviation",
+        "significance_marker",
+        "unit_id",
+        "value_source",
+        "review_status",
+        "confidence",
+        "is_missing",
+        "is_image_estimate",
+        "is_manually_modified",
+        "notes",
+        "metadata",
+    )
+    evidence_columns = (
+        "extraction_evidence_id",
+        "document_version_id",
+        "page_id",
+        "block_id",
+        "table_cell_id",
+        "figure_id",
+        "evidence_text",
+        "bbox",
+        "is_primary",
+    )
+    return {
+        "fields": [{column: field[column] for column in field_columns} for field in fields],
+        "rows": [{column: row[column] for column in row_columns} for row in rows],
+        "cells": [
+            {
+                "row_key": row_key[cell["row_id"]],
+                "field_key": field_key[cell["field_id"]],
+                **{column: cell[column] for column in cell_columns},
+            }
+            for cell in sorted(
+                cells,
+                key=lambda item: (
+                    row_key[item["row_id"]],
+                    field_key[item["field_id"]],
+                ),
+            )
+        ],
+        "evidence": [
+            {
+                "row_key": cell_position[item["dataset_cell_id"]][0],
+                "field_key": cell_position[item["dataset_cell_id"]][1],
+                **{column: item[column] for column in evidence_columns},
+            }
+            for item in sorted(
+                evidence,
+                key=lambda item: (
+                    cell_position[item["dataset_cell_id"]],
+                    not item["is_primary"],
+                    item["evidence_text"],
+                    str(item["page_id"]),
+                ),
+            )
+        ],
+    }
+
+
 class DatasetService:
     def __init__(self, db: Session, storage: LocalStorage) -> None:
         self.db = db
@@ -165,11 +333,33 @@ class DatasetService:
         )
         return [dict(row) for row in rows]
 
+    def list_versions(self, project_id: UUID, dataset_id: UUID) -> list[dict]:
+        datasets = table(self.db, "datasets")
+        versions = table(self.db, "dataset_versions")
+        if not self.db.scalar(
+            select(datasets.c.id).where(
+                datasets.c.id == dataset_id,
+                datasets.c.project_id == project_id,
+                datasets.c.deleted_at.is_(None),
+            )
+        ):
+            raise AppError(code="dataset_not_found", message="数据集不存在", status_code=404)
+        rows = self.db.execute(
+            select(versions)
+            .where(versions.c.dataset_id == dataset_id)
+            .order_by(versions.c.version_no.desc())
+        ).mappings()
+        return [dict(row) for row in rows]
+
     def get_version(self, project_id: UUID, version_id: UUID, offset: int, limit: int) -> dict:
         dataset_data, version_data = self._version_context(project_id, version_id)
         fields = table(self.db, "dataset_fields")
         rows = table(self.db, "dataset_rows")
         cells = table(self.db, "dataset_cells")
+        evidence = table(self.db, "dataset_cell_evidence")
+        document_versions = table(self.db, "document_versions")
+        documents = table(self.db, "documents")
+        pages = table(self.db, "document_pages")
         field_rows = [
             dict(row)
             for row in self.db.execute(
@@ -194,10 +384,44 @@ class DatasetService:
             if row_ids
             else []
         )
+        cell_ids = [cell["id"] for cell in cell_rows]
+        evidence_rows = (
+            self.db.execute(
+                select(
+                    evidence,
+                    documents.c.id.label("document_id"),
+                    documents.c.title.label("document_title"),
+                    pages.c.page_no,
+                    pages.c.width.label("page_width"),
+                    pages.c.height.label("page_height"),
+                )
+                .join(
+                    document_versions,
+                    document_versions.c.id == evidence.c.document_version_id,
+                )
+                .join(documents, documents.c.id == document_versions.c.document_id)
+                .join(pages, pages.c.id == evidence.c.page_id)
+                .where(evidence.c.dataset_cell_id.in_(cell_ids))
+                .order_by(
+                    evidence.c.dataset_cell_id,
+                    evidence.c.is_primary.desc(),
+                    evidence.c.created_at,
+                )
+            )
+            .mappings()
+            .all()
+            if cell_ids
+            else []
+        )
+        evidence_by_cell: dict[UUID, list[dict]] = defaultdict(list)
+        for item in evidence_rows:
+            evidence_by_cell[item["dataset_cell_id"]].append(dict(item))
         by_row: dict[UUID, dict[str, dict]] = defaultdict(dict)
         field_key = {field["id"]: field["field_key"] for field in field_rows}
         for cell in cell_rows:
-            by_row[cell["row_id"]][field_key[cell["field_id"]]] = dict(cell)
+            cell_data = dict(cell)
+            cell_data["evidence"] = evidence_by_cell.get(cell["id"], [])
+            by_row[cell["row_id"]][field_key[cell["field_id"]]] = cell_data
         for row in row_rows:
             row["cells"] = by_row.get(row["id"], {})
         return {
@@ -362,7 +586,9 @@ class DatasetService:
     def delete_row(
         self, project_id: UUID, version_id: UUID, row_id: UUID, actor_id: UUID | None
     ) -> None:
-        self._version_context(project_id, version_id)
+        _, version = self._version_context(project_id, version_id)
+        if version["status"] != "draft":
+            raise AppError(code="dataset_immutable", message="冻结版本不可修改", status_code=409)
         rows = table(self.db, "dataset_rows")
         result = self.db.execute(
             update(rows)
@@ -389,24 +615,62 @@ class DatasetService:
         fields = table(self.db, "dataset_fields")
         rows = table(self.db, "dataset_rows")
         cells = table(self.db, "dataset_cells")
-        snapshot = [
+        evidence = table(self.db, "dataset_cell_evidence")
+        field_rows = [
             dict(row)
             for row in self.db.execute(
-                select(
-                    rows.c.row_key,
-                    fields.c.field_key,
-                    cells.c.raw_value,
-                    cells.c.normalized_value,
-                    cells.c.ml_value,
-                    cells.c.value_text,
-                    cells.c.value_number,
-                )
-                .join(cells, cells.c.row_id == rows.c.id)
-                .join(fields, fields.c.id == cells.c.field_id)
-                .where(rows.c.dataset_version_id == version_id, rows.c.is_deleted.is_(False))
-                .order_by(rows.c.row_no, fields.c.position)
+                select(fields)
+                .where(fields.c.dataset_version_id == version_id)
+                .order_by(fields.c.position, fields.c.field_key)
             ).mappings()
         ]
+        row_rows = [
+            dict(row)
+            for row in self.db.execute(
+                select(rows)
+                .where(rows.c.dataset_version_id == version_id, rows.c.is_deleted.is_(False))
+                .order_by(rows.c.row_no, rows.c.row_key)
+            ).mappings()
+        ]
+        row_ids = [row["id"] for row in row_rows]
+        cell_rows = (
+            [
+                dict(row)
+                for row in self.db.execute(
+                    select(cells)
+                    .where(cells.c.row_id.in_(row_ids))
+                    .order_by(cells.c.row_id, cells.c.field_id)
+                ).mappings()
+            ]
+            if row_ids
+            else []
+        )
+        cell_ids = [cell["id"] for cell in cell_rows]
+        evidence_rows = (
+            [
+                dict(row)
+                for row in self.db.execute(
+                    select(evidence)
+                    .where(evidence.c.dataset_cell_id.in_(cell_ids))
+                    .order_by(
+                        evidence.c.dataset_cell_id,
+                        evidence.c.is_primary.desc(),
+                        evidence.c.created_at,
+                    )
+                ).mappings()
+            ]
+            if cell_ids
+            else []
+        )
+        issues = _freeze_issues(field_rows, row_rows, cell_rows)
+        if issues:
+            raise AppError(
+                code="dataset_freeze_validation_failed",
+                message="数据集存在必填缺失或疑似值，无法冻结",
+                status_code=409,
+                details={"issue_count": len(issues), "issues": issues},
+            )
+        snapshot = _freeze_snapshot(field_rows, row_rows, cell_rows, evidence_rows)
         content_hash = hashlib.sha256(
             json.dumps(snapshot, ensure_ascii=False, default=str, sort_keys=True).encode()
         ).hexdigest()

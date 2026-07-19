@@ -1,7 +1,7 @@
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class TaskAccepted(BaseModel):
@@ -31,6 +31,12 @@ class TermCategoryCreate(BaseModel):
     description: str | None = None
 
 
+class TermCategoryUpdate(BaseModel):
+    code: str | None = Field(default=None, min_length=1, max_length=100)
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    description: str | None = None
+
+
 class TermCreate(BaseModel):
     category_id: UUID
     canonical_name: str = Field(min_length=1, max_length=240)
@@ -44,13 +50,18 @@ class TermCreate(BaseModel):
 
 
 class TermUpdate(BaseModel):
+    category_id: UUID | None = None
     canonical_name: str | None = Field(default=None, min_length=1, max_length=240)
     definition: str | None = None
+    language: str | None = Field(default=None, max_length=20)
+    data_type: str | None = Field(default=None, max_length=32)
+    semantic_role: str | None = Field(default=None, max_length=32)
     status: str | None = Field(default=None, max_length=32)
     is_selected: bool | None = None
     include_in_model: bool | None = None
     include_in_score: bool | None = None
     indicator_direction: str | None = Field(default=None, max_length=32)
+    aliases: list[str] | None = None
 
 
 class TermMerge(BaseModel):
@@ -102,11 +113,35 @@ class FieldSchemaCreate(BaseModel):
     settings: dict[str, Any] = Field(default_factory=dict)
 
 
+class FieldSchemaUpdate(BaseModel):
+    name: str = Field(min_length=1, max_length=240)
+    settings: dict[str, Any]
+    fields: list[FieldDefinitionInput] = Field(min_length=1, max_length=500)
+
+
 class ExtractionCreate(BaseModel):
     name: str | None = Field(default=None, max_length=240)
     field_schema_id: UUID
     search_run_id: UUID | None = None
     configuration: dict[str, Any] = Field(default_factory=dict)
+
+
+class ExtractionRecordReview(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    review_status: Literal["confirmed", "modified", "doubtful", "excluded"]
+    normalized_value: dict[str, Any] | None = None
+    ml_value: dict[str, Any] | None = None
+    notes: str | None = Field(default=None, max_length=5000)
+
+
+class ExtractionRunSummary(BaseModel):
+    extraction_run_id: UUID
+    status: str
+    total_records: int
+    field_count: int
+    document_count: int
+    review_status_counts: dict[str, int]
 
 
 class TranslationCreate(BaseModel):

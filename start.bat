@@ -101,7 +101,7 @@ echo [INFO] API and worker log windows will remain open until you close them.
 echo [INFO] API docs: http://127.0.0.1:8000/docs
 start "" "http://127.0.0.1:8000/docs"
 popd
-timeout /t 3 /nobreak >nul
+powershell -NoProfile -Command "Start-Sleep -Seconds 3"
 exit /b 0
 
 :find_python

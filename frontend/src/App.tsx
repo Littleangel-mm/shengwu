@@ -10,11 +10,13 @@ import {
   CircleCheck,
   Database,
   Download,
+  Edit3,
   FileSearch,
   FileText,
   FlaskConical,
   FolderKanban,
   Gem,
+  GitMerge,
   Image,
   Layers3,
   Languages,
@@ -25,10 +27,13 @@ import {
   Network,
   Plus,
   RotateCcw,
+  Save,
+  Scissors,
   Search,
   ShieldCheck,
   Sparkles,
   Table2,
+  Trash2,
   Upload,
   UserRound,
   X,
@@ -55,13 +60,18 @@ import {
   useParams,
 } from 'react-router-dom'
 import {
+  ApiError,
   api,
   type GenericRecord,
+  type FieldDefinition,
+  type FieldSchema,
+  type ExtractionRecord,
   type JobItem,
   type Project,
   type SearchMode,
   type SearchRun,
   type SearchScope,
+  type Term,
   session,
   type User,
 } from './lib/api'
@@ -169,7 +179,28 @@ function StatusPill({ value }: { value: unknown }) {
 function ErrorNotice({ error }: { error: unknown }) {
   if (!error) return null
   const message = error instanceof Error ? error.message : '请求失败，请稍后重试'
-  return <div className="error-notice">{message}</div>
+  const details = error instanceof ApiError ? error.details : null
+  const issues = Array.isArray(details)
+    ? details
+    : details && typeof details === 'object' && 'issues' in details && Array.isArray(details.issues)
+      ? details.issues
+      : []
+  return (
+    <div className="error-notice">
+      <strong>{message}</strong>
+      {issues.length > 0 && (
+        <ul>
+          {issues.slice(0, 8).map((issue, index) => (
+            <li key={index}>
+              {typeof issue === 'string'
+                ? issue
+                : JSON.stringify(issue)}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  )
 }
 
 function LoadingPane({ label = '正在同步研究数据' }: { label?: string }) {
@@ -732,7 +763,7 @@ const workspaceNav = [
 ]
 
 function WorkspacePage() {
-  const { projectId = '', section = 'overview', documentId } = useParams()
+  const { projectId = '', section = 'overview', documentId, datasetId, datasetVersionId } = useParams()
   const [mobileNav, setMobileNav] = useState(false)
   const project = useQuery({
     queryKey: ['project', projectId],
@@ -784,11 +815,19 @@ function WorkspacePage() {
           title={
             documentId
               ? '文献详情'
+              : datasetVersionId
+                ? '数据集工作台'
               : workspaceNav.find((item) => item.key === section)?.label || '项目概览'
           }
         />
         {documentId ? (
           <DocumentDetailSection projectId={projectId} documentId={documentId} />
+        ) : datasetId && datasetVersionId ? (
+          <DatasetWorkbench
+            projectId={projectId}
+            datasetId={datasetId}
+            versionId={datasetVersionId}
+          />
         ) : (
           <WorkspaceSection projectId={projectId} section={section} project={project.data} />
         )}
@@ -809,17 +848,7 @@ function WorkspaceSection({
   if (section === 'overview') return <OverviewSection projectId={projectId} project={project} />
   if (section === 'documents') return <DocumentsSection projectId={projectId} />
   if (section === 'search') return <SearchSection projectId={projectId} />
-  if (section === 'terms')
-    return (
-      <RecordsSection
-        title="术语与字段方案"
-        eyebrow="统一研究语言"
-        description="审核术语、别名和字段方案，建立统一研究语言。"
-        queryKey={['terms', projectId]}
-        queryFn={() => api.terms(projectId)}
-        unwrap={(data) => (data as Awaited<ReturnType<typeof api.terms>>).items}
-      />
-    )
+  if (section === 'terms') return <TermsSection projectId={projectId} />
   if (section === 'extraction') return <ExtractionSection projectId={projectId} />
   if (section === 'datasets') return <DatasetsSection projectId={projectId} />
   if (section === 'models')
@@ -1808,6 +1837,411 @@ function SearchSection({ projectId }: { projectId: string }) {
   )
 }
 
+const emptyField = (): FieldDefinition => ({
+  field_key: '',
+  display_name: '',
+  semantic_role: 'feature',
+  data_type: 'text',
+  is_required: false,
+  is_identifier: false,
+  include_in_model: false,
+  include_in_score: false,
+  extraction_config: {},
+  validation_rules: {},
+})
+
+function TermsSection({ projectId }: { projectId: string }) {
+  const queryClient = useQueryClient()
+  const [tab, setTab] = useState<'terms' | 'schemas'>('terms')
+  const [categoryId, setCategoryId] = useState('')
+  const [status, setStatus] = useState('')
+  const [selectedIds, setSelectedIds] = useState<string[]>([])
+  const [editingTerm, setEditingTerm] = useState<Term | null>(null)
+  const [termEditorOpen, setTermEditorOpen] = useState(false)
+  const [termName, setTermName] = useState('')
+  const [termAliases, setTermAliases] = useState('')
+  const [termDefinition, setTermDefinition] = useState('')
+  const [termCategory, setTermCategory] = useState('')
+  const [schemaDraft, setSchemaDraft] = useState<FieldSchema | null>(null)
+  const [schemaName, setSchemaName] = useState('')
+  const [schemaFields, setSchemaFields] = useState<FieldDefinition[]>([emptyField()])
+  const categories = useQuery({
+    queryKey: ['term-categories', projectId],
+    queryFn: () => api.termCategories(projectId),
+  })
+  const terms = useQuery({
+    queryKey: ['terms', projectId, categoryId, status],
+    queryFn: () => api.terms(projectId, categoryId || undefined, status || undefined),
+  })
+  const schemas = useQuery({
+    queryKey: ['field-schemas', projectId],
+    queryFn: () => api.fieldSchemas(projectId),
+  })
+  const searches = useQuery({
+    queryKey: ['search-runs', projectId],
+    queryFn: () => api.searchRuns(projectId),
+  })
+  const units = useQuery({ queryKey: ['units'], queryFn: api.units })
+  const refreshTerms = () =>
+    Promise.all([
+      queryClient.invalidateQueries({ queryKey: ['terms', projectId] }),
+      queryClient.invalidateQueries({ queryKey: ['term-categories', projectId] }),
+    ])
+
+  const saveTerm = useMutation({
+    mutationFn: () => {
+      const payload = {
+        category_id: termCategory,
+        canonical_name: termName,
+        definition: termDefinition || null,
+        language: 'zh-CN',
+        data_type: editingTerm?.data_type || 'text',
+        semantic_role: editingTerm?.semantic_role || 'feature',
+        status: editingTerm?.status || 'confirmed',
+        is_selected: editingTerm?.is_selected ?? true,
+        aliases: termAliases.split(/[,，\n]/).map((item) => item.trim()).filter(Boolean),
+      }
+      return editingTerm
+        ? api.updateTerm(projectId, editingTerm.id, payload)
+        : api.createTerm(projectId, payload)
+    },
+    onSuccess: async () => {
+      setEditingTerm(null)
+      setTermEditorOpen(false)
+      setTermName('')
+      setTermAliases('')
+      setTermDefinition('')
+      await refreshTerms()
+    },
+  })
+  const updateTerm = useMutation({
+    mutationFn: ({
+      termId,
+      payload,
+    }: {
+      termId: string
+      payload: Omit<Partial<Term>, 'aliases'> & { aliases?: string[] }
+    }) =>
+      api.updateTerm(projectId, termId, payload),
+    onSuccess: refreshTerms,
+  })
+  const deleteTerm = useMutation({
+    mutationFn: (termId: string) => api.deleteTerm(projectId, termId),
+    onSuccess: refreshTerms,
+  })
+  const merge = useMutation({
+    mutationFn: ({ target, sources }: { target: string; sources: string[] }) =>
+      api.mergeTerms(projectId, target, sources, '前端人工审核合并'),
+    onSuccess: async () => {
+      setSelectedIds([])
+      await refreshTerms()
+    },
+  })
+  const split = useMutation({
+    mutationFn: ({ term, names }: { term: Term; names: string[] }) =>
+      api.splitTerm(
+        projectId,
+        term.id,
+        names.map((name) => ({ category_id: term.category_id, canonical_name: name, aliases: [] })),
+      ),
+    onSuccess: refreshTerms,
+  })
+  const discover = useMutation({
+    mutationFn: (runId: string) => api.discoverTerms(projectId, runId),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['jobs', projectId] }),
+  })
+  const saveSchema = useMutation({
+    mutationFn: () => {
+      const payload = {
+        name: schemaName,
+        source_search_run_id: schemaDraft?.source_search_run_id || null,
+        fields: schemaFields,
+        settings: schemaDraft?.settings || {},
+      }
+      return schemaDraft
+        ? api.updateFieldSchema(projectId, schemaDraft.id, payload)
+        : api.createFieldSchema(projectId, payload)
+    },
+    onSuccess: async () => {
+      setSchemaDraft(null)
+      setSchemaName('')
+      setSchemaFields([emptyField()])
+      await queryClient.invalidateQueries({ queryKey: ['field-schemas', projectId] })
+    },
+  })
+  const freezeSchema = useMutation({
+    mutationFn: (schemaId: string) => api.freezeFieldSchema(projectId, schemaId),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['field-schemas', projectId] }),
+  })
+
+  const beginEditTerm = (term?: Term) => {
+    setEditingTerm(term || null)
+    setTermEditorOpen(true)
+    setTermName(term?.canonical_name || '')
+    setTermDefinition(term?.definition || '')
+    setTermCategory(term?.category_id || categoryId || categories.data?.[0]?.id || '')
+    setTermAliases(
+      (term?.aliases || [])
+        .map((alias) => (typeof alias === 'string' ? alias : alias.alias_text))
+        .join('，'),
+    )
+  }
+  const beginEditSchema = async (schema?: FieldSchema) => {
+    if (!schema) {
+      setSchemaDraft(null)
+      setSchemaName('')
+      setSchemaFields([emptyField()])
+      return
+    }
+    const detail = await api.fieldSchema(projectId, schema.id)
+    setSchemaDraft(detail)
+    setSchemaName(detail.name)
+    setSchemaFields(detail.fields?.length ? detail.fields : [emptyField()])
+  }
+  const operationError =
+    saveTerm.error ||
+    updateTerm.error ||
+    deleteTerm.error ||
+    merge.error ||
+    split.error ||
+    discover.error ||
+    saveSchema.error ||
+    freezeSchema.error
+
+  return (
+    <div className="workspace-content">
+      <SectionIntro
+        eyebrow="统一研究语言"
+        title="术语与字段方案"
+        description="审核候选术语、维护别名，并将确认术语转化为可冻结的字段方案。"
+        action={
+          <div className="segment-tabs">
+            <button className={tab === 'terms' ? 'active' : ''} onClick={() => setTab('terms')}>术语管理</button>
+            <button className={tab === 'schemas' ? 'active' : ''} onClick={() => setTab('schemas')}>字段方案</button>
+          </div>
+        }
+      />
+      <ErrorNotice error={operationError} />
+      {tab === 'terms' ? (
+        <>
+          <div className="term-toolbar glass">
+            <select value={categoryId} onChange={(event) => setCategoryId(event.target.value)}>
+              <option value="">全部分类</option>
+              {categories.data?.map((category) => (
+                <option key={category.id} value={category.id}>{category.name}</option>
+              ))}
+            </select>
+            <select value={status} onChange={(event) => setStatus(event.target.value)}>
+              <option value="">全部状态</option>
+              <option value="candidate">候选</option>
+              <option value="confirmed">已确认</option>
+              <option value="merged">已合并</option>
+              <option value="split">已拆分</option>
+            </select>
+            <button className="button button-secondary" onClick={() => {
+              const name = window.prompt('分类名称')
+              if (!name) return
+              const code = window.prompt('分类代码（英文或拼音）', name.toLowerCase().replace(/\s+/g, '_'))
+              if (code) api.createTermCategory(projectId, { name, code }).then(refreshTerms)
+            }}><Plus size={15} /> 新建分类</button>
+            {categoryId && (
+              <button className="button button-secondary" onClick={() => {
+                const category = categories.data?.find((item) => item.id === categoryId)
+                const name = window.prompt('修改分类名称', category?.name || '')
+                if (name) api.updateTermCategory(projectId, categoryId, { name }).then(refreshTerms)
+              }}><Edit3 size={15} /> 编辑分类</button>
+            )}
+            {categoryId && (
+              <button className="button button-secondary" onClick={() => {
+                if (window.confirm('仅空分类可以删除，确认继续？')) {
+                  api.deleteTermCategory(projectId, categoryId).then(() => {
+                    setCategoryId('')
+                    return refreshTerms()
+                  }).catch((categoryError: unknown) => {
+                    window.alert(categoryError instanceof Error ? categoryError.message : '分类删除失败')
+                  })
+                }
+              }}><Trash2 size={15} /> 删除分类</button>
+            )}
+            <button className="button button-primary" onClick={() => beginEditTerm()}>
+              <Plus size={15} /> 新建术语
+            </button>
+            <select
+              defaultValue=""
+              onChange={(event) => event.target.value && discover.mutate(event.target.value)}
+            >
+              <option value="">从检索发现术语</option>
+              {searches.data?.items.map((run) => (
+                <option value={run.id} key={run.id}>{run.name || run.terms.join('、')}</option>
+              ))}
+            </select>
+          </div>
+          {selectedIds.length >= 2 && (
+            <div className="selection-bar glass">
+              <span>已选择 {selectedIds.length} 个术语</span>
+              <button className="mini-button" onClick={() => {
+                const target = selectedIds[0]
+                if (window.confirm('将其他选中术语合并到第一个术语？此操作会迁移别名和字段引用。')) {
+                  merge.mutate({ target, sources: selectedIds.slice(1) })
+                }
+              }}><GitMerge size={14} /> 合并到第一个</button>
+              <button className="mini-button" onClick={() => setSelectedIds([])}>取消选择</button>
+            </div>
+          )}
+          <section className="panel glass">
+            <PanelHeading eyebrow="术语词典" title={`${terms.data?.total || 0} 个术语`} />
+            {terms.isLoading ? <LoadingPane /> : terms.data?.items.length ? (
+              <div className="term-grid">
+                {terms.data.items.map((term) => (
+                  <article className={`term-card ${selectedIds.includes(term.id) ? 'selected' : ''}`} key={term.id}>
+                    <header>
+                      <input
+                        type="checkbox"
+                        checked={selectedIds.includes(term.id)}
+                        onChange={() => setSelectedIds((current) =>
+                          current.includes(term.id)
+                            ? current.filter((id) => id !== term.id)
+                            : [...current, term.id],
+                        )}
+                      />
+                      <StatusPill value={term.status} />
+                    </header>
+                    <h3>{term.canonical_name}</h3>
+                    <p>{term.definition || '暂无定义'}</p>
+                    <div className="term-aliases">
+                      {(term.aliases || []).slice(0, 4).map((alias, index) => (
+                        <span key={index}>{typeof alias === 'string' ? alias : alias.alias_text}</span>
+                      ))}
+                    </div>
+                    <div className="term-flags">
+                      <label><input type="checkbox" checked={term.include_in_model} onChange={(event) =>
+                        updateTerm.mutate({ termId: term.id, payload: { include_in_model: event.target.checked } })
+                      } /> 建模</label>
+                      <label><input type="checkbox" checked={term.include_in_score} onChange={(event) =>
+                        updateTerm.mutate({ termId: term.id, payload: { include_in_score: event.target.checked } })
+                      } /> 评分</label>
+                    </div>
+                    <footer>
+                      <button className="mini-button" onClick={() => beginEditTerm(term)}><Edit3 size={13} /> 编辑</button>
+                      <button className="mini-button" onClick={() => {
+                        const names = window.prompt('请输入拆分后的术语，至少两个，用逗号分隔')
+                          ?.split(/[,，]/).map((item) => item.trim()).filter(Boolean)
+                        if (names && names.length >= 2 && window.confirm(`确认将“${term.canonical_name}”拆分为 ${names.length} 个术语？`)) {
+                          split.mutate({ term, names })
+                        }
+                      }}><Scissors size={13} /> 拆分</button>
+                      <button className="mini-button exclude" onClick={() => {
+                        if (window.confirm(`确认删除术语“${term.canonical_name}”？`)) deleteTerm.mutate(term.id)
+                      }}><Trash2 size={13} /> 删除</button>
+                    </footer>
+                  </article>
+                ))}
+              </div>
+            ) : <EmptyInline text="当前筛选下没有术语" />}
+          </section>
+          {termEditorOpen && (
+            <section className="editor-panel glass">
+              <PanelHeading eyebrow={editingTerm ? '修改术语' : '新建术语'} title={editingTerm?.canonical_name || '创建研究术语'} />
+              <div className="editor-form-grid">
+                <label><span>标准名称</span><input value={termName} onChange={(event) => setTermName(event.target.value)} /></label>
+                <label><span>分类</span><select value={termCategory} onChange={(event) => setTermCategory(event.target.value)}>
+                  <option value="">选择分类</option>
+                  {categories.data?.map((category) => <option value={category.id} key={category.id}>{category.name}</option>)}
+                </select></label>
+                <label className="span-two"><span>别名（逗号分隔）</span><input value={termAliases} onChange={(event) => setTermAliases(event.target.value)} /></label>
+                <label className="span-two"><span>定义</span><input value={termDefinition} onChange={(event) => setTermDefinition(event.target.value)} /></label>
+              </div>
+              <div className="editor-actions">
+                <button className="button button-secondary" onClick={() => {
+                  setEditingTerm(null); setTermEditorOpen(false); setTermName(''); setTermAliases(''); setTermDefinition('')
+                }}>取消</button>
+                <button className="button button-primary" disabled={!termName || !termCategory || saveTerm.isPending} onClick={() => saveTerm.mutate()}>
+                  <Save size={15} /> 保存术语
+                </button>
+              </div>
+            </section>
+          )}
+        </>
+      ) : (
+        <div className="schema-layout">
+          <section className="panel glass schema-list">
+            <div className="panel-title-row">
+              <PanelHeading eyebrow="方案版本" title={`${schemas.data?.length || 0} 个方案`} />
+              <button className="mini-button" onClick={() => beginEditSchema()}><Plus size={14} /> 新建</button>
+            </div>
+            {schemas.data?.map((schema) => (
+              <button className={`schema-list-item ${schemaDraft?.id === schema.id ? 'active' : ''}`} key={schema.id} onClick={() => beginEditSchema(schema)}>
+                <span><strong>{schema.name}</strong><small>V{schema.version_no}</small></span>
+                <StatusPill value={schema.status} />
+              </button>
+            ))}
+          </section>
+          <section className="editor-panel glass schema-editor">
+            <div className="panel-title-row">
+              <PanelHeading eyebrow="字段方案编辑器" title={schemaDraft?.name || '新字段方案'} />
+              {schemaDraft?.status === 'draft' && (
+                <button className="button button-secondary" onClick={() => {
+                  if (window.confirm('冻结后不可直接修改，确认冻结该字段方案？')) freezeSchema.mutate(schemaDraft.id)
+                }}>冻结方案</button>
+              )}
+            </div>
+            <label><span>方案名称</span><input value={schemaName} disabled={schemaDraft?.status === 'frozen'} onChange={(event) => setSchemaName(event.target.value)} /></label>
+            <div className="field-editor-list">
+              {schemaFields.map((field, index) => (
+                <div className="field-editor-row" key={field.id || index}>
+                  <input value={field.field_key} placeholder="field_key" disabled={schemaDraft?.status === 'frozen'} onChange={(event) =>
+                    setSchemaFields((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, field_key: event.target.value } : item))
+                  } />
+                  <input value={field.display_name} placeholder="显示名称" disabled={schemaDraft?.status === 'frozen'} onChange={(event) =>
+                    setSchemaFields((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, display_name: event.target.value } : item))
+                  } />
+                  <select value={field.source_term_id || ''} disabled={schemaDraft?.status === 'frozen'} onChange={(event) =>
+                    setSchemaFields((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, source_term_id: event.target.value || null } : item))
+                  }><option value="">不关联术语</option>{terms.data?.items.filter((term) => term.status === 'confirmed').map((term) =>
+                    <option value={term.id} key={term.id}>{term.canonical_name}</option>
+                  )}</select>
+                  <select value={field.data_type} disabled={schemaDraft?.status === 'frozen'} onChange={(event) =>
+                    setSchemaFields((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, data_type: event.target.value as FieldDefinition['data_type'] } : item))
+                  }>{['text', 'number', 'boolean', 'date', 'category', 'range'].map((value) => <option value={value} key={value}>{value}</option>)}</select>
+                  <select value={field.semantic_role} disabled={schemaDraft?.status === 'frozen'} onChange={(event) =>
+                    setSchemaFields((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, semantic_role: event.target.value } : item))
+                  }>
+                    <option value="identifier">标识</option>
+                    <option value="feature">特征</option>
+                    <option value="target">目标</option>
+                    <option value="group">处理组</option>
+                    <option value="timepoint">时间点</option>
+                    <option value="condition">实验条件</option>
+                  </select>
+                  <select value={field.preferred_unit_id || ''} disabled={schemaDraft?.status === 'frozen'} onChange={(event) =>
+                    setSchemaFields((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, preferred_unit_id: event.target.value || null } : item))
+                  }><option value="">无单位</option>{units.data?.map((unit) => <option value={unit.id} key={unit.id}>{unit.symbol || unit.name}</option>)}</select>
+                  <label><input type="checkbox" checked={field.is_required} disabled={schemaDraft?.status === 'frozen'} onChange={(event) =>
+                    setSchemaFields((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, is_required: event.target.checked } : item))
+                  } /> 必填</label>
+                  <label><input type="checkbox" checked={field.include_in_model} disabled={schemaDraft?.status === 'frozen'} onChange={(event) =>
+                    setSchemaFields((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, include_in_model: event.target.checked } : item))
+                  } /> 建模</label>
+                  <label><input type="checkbox" checked={field.include_in_score} disabled={schemaDraft?.status === 'frozen'} onChange={(event) =>
+                    setSchemaFields((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, include_in_score: event.target.checked } : item))
+                  } /> 评分</label>
+                  {schemaDraft?.status !== 'frozen' && <button className="mini-button exclude" onClick={() => setSchemaFields((current) => current.filter((_, itemIndex) => itemIndex !== index))}><Trash2 size={13} /></button>}
+                </div>
+              ))}
+            </div>
+            {schemaDraft?.status !== 'frozen' && (
+              <div className="editor-actions">
+                <button className="button button-secondary" onClick={() => setSchemaFields((current) => [...current, emptyField()])}><Plus size={14} /> 增加字段</button>
+                <button className="button button-primary" disabled={!schemaName || !schemaFields.length || saveSchema.isPending} onClick={() => saveSchema.mutate()}><Save size={14} /> 保存方案</button>
+              </div>
+            )}
+          </section>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function RecordsSection({
   title,
   eyebrow,
@@ -1880,6 +2314,11 @@ function RecordsPanel({
 function ExtractionSection({ projectId }: { projectId: string }) {
   const queryClient = useQueryClient()
   const [schemaId, setSchemaId] = useState('')
+  const [searchRunId, setSearchRunId] = useState('')
+  const [selectedRunId, setSelectedRunId] = useState('')
+  const [recordStatus, setRecordStatus] = useState('')
+  const [fieldFilter, setFieldFilter] = useState('')
+  const [documentFilter, setDocumentFilter] = useState('')
   const schemas = useQuery({
     queryKey: ['field-schemas', projectId],
     queryFn: () => api.fieldSchemas(projectId),
@@ -1887,11 +2326,71 @@ function ExtractionSection({ projectId }: { projectId: string }) {
   const extractions = useQuery({
     queryKey: ['extractions', projectId],
     queryFn: () => api.extractions(projectId),
+    refetchInterval: 4_000,
+  })
+  const searches = useQuery({
+    queryKey: ['search-runs', projectId],
+    queryFn: () => api.searchRuns(projectId),
+  })
+  useEffect(() => {
+    if (!selectedRunId && extractions.data?.[0]) setSelectedRunId(extractions.data[0].id)
+  }, [extractions.data, selectedRunId])
+  const records = useQuery({
+    queryKey: ['extraction-records', projectId, selectedRunId, fieldFilter, documentFilter, recordStatus],
+    queryFn: () =>
+      api.extractionRecords(projectId, selectedRunId, {
+        field_definition_id: fieldFilter || undefined,
+        document_version_id: documentFilter || undefined,
+        review_status: recordStatus || undefined,
+      }),
+    enabled: Boolean(selectedRunId),
+  })
+  const summary = useQuery({
+    queryKey: ['extraction-summary', projectId, selectedRunId],
+    queryFn: () => api.extractionSummary(projectId, selectedRunId),
+    enabled: Boolean(selectedRunId),
   })
   const create = useMutation({
-    mutationFn: () => api.createExtraction(projectId, schemaId),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['extractions', projectId] }),
+    mutationFn: () => api.createExtraction(projectId, schemaId, searchRunId || undefined),
+    onSuccess: async (accepted) => {
+      setSelectedRunId(accepted.resource_id)
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['extractions', projectId] }),
+        queryClient.invalidateQueries({ queryKey: ['jobs', projectId] }),
+      ])
+    },
   })
+  const review = useMutation({
+    mutationFn: ({
+      record,
+      review_status,
+      normalizedValue,
+    }: {
+      record: ExtractionRecord
+      review_status: ExtractionRecord['review_status']
+      normalizedValue?: string
+    }) =>
+      api.reviewExtractionRecord(projectId, selectedRunId, record.id, {
+        review_status,
+        normalized_value:
+          normalizedValue === undefined
+            ? undefined
+            : { value: Number.isNaN(Number(normalizedValue)) ? normalizedValue : Number(normalizedValue) },
+      }),
+    onSuccess: () =>
+      Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['extraction-records', projectId, selectedRunId] }),
+        queryClient.invalidateQueries({ queryKey: ['extraction-summary', projectId, selectedRunId] }),
+      ]),
+  })
+  const selectedRun = extractions.data?.find((run) => run.id === selectedRunId)
+  const allRecords = records.data?.items || []
+  const fields = Array.from(
+    new Map(allRecords.map((record) => [record.field_definition_id, record])).values(),
+  )
+  const documents = Array.from(
+    new Map(allRecords.filter((record) => record.document_version_id).map((record) => [record.document_version_id, record])).values(),
+  )
   return (
     <div className="workspace-content">
       <SectionIntro
@@ -1908,10 +2407,16 @@ function ExtractionSection({ projectId }: { projectId: string }) {
       >
         <select value={schemaId} onChange={(event) => setSchemaId(event.target.value)} required>
           <option value="">选择字段方案</option>
-          {schemas.data?.map((schema) => (
+          {schemas.data?.filter((schema) => schema.status === 'frozen').map((schema) => (
             <option key={schema.id} value={schema.id}>
               {String(schema.name)}
             </option>
+          ))}
+        </select>
+        <select value={searchRunId} onChange={(event) => setSearchRunId(event.target.value)}>
+          <option value="">全部项目文献</option>
+          {searches.data?.items.map((run) => (
+            <option value={run.id} key={run.id}>{run.name || run.terms.join('、')}</option>
           ))}
         </select>
         <button className="button button-primary" disabled={create.isPending}>
@@ -1919,13 +2424,91 @@ function ExtractionSection({ projectId }: { projectId: string }) {
         </button>
       </form>
       <ErrorNotice error={create.error} />
-      <RecordsPanel records={extractions.data || []} loading={extractions.isLoading} empty="暂无抽取运行" />
+      <div className="search-workbench extraction-workbench">
+        <aside className="search-history glass">
+          <PanelHeading eyebrow="抽取历史" title={`${extractions.data?.length || 0} 次运行`} />
+          <div className="search-run-list">
+            {extractions.data?.map((run) => (
+              <button className={run.id === selectedRunId ? 'active' : ''} key={run.id} onClick={() => setSelectedRunId(run.id)}>
+                <span><strong>{run.name || '智能抽取'}</strong><small>{new Date(run.created_at).toLocaleString('zh-CN')}</small></span>
+                <StatusPill value={run.status} />
+              </button>
+            ))}
+          </div>
+        </aside>
+        <section className="search-results glass">
+          <div className="search-results-head">
+            <div>
+              <span className="eyebrow">结构化记录</span>
+              <h3>{selectedRun?.name || '选择抽取运行'}</h3>
+              <p>
+                共 {records.data?.total || 0} 条 · 已确认 {summary.data?.review_status_counts.confirmed || 0} ·
+                标疑 {summary.data?.review_status_counts.doubtful || 0} · 已排除 {summary.data?.review_status_counts.excluded || 0}
+              </p>
+            </div>
+            <div className="record-filters">
+              <select value={fieldFilter} onChange={(event) => setFieldFilter(event.target.value)}>
+                <option value="">全部字段</option>
+                {fields.map((record) => <option value={record.field_definition_id} key={record.field_definition_id}>{record.field_display_name || record.field_key}</option>)}
+              </select>
+              <select value={documentFilter} onChange={(event) => setDocumentFilter(event.target.value)}>
+                <option value="">全部文献</option>
+                {documents.map((record) => <option value={record.document_version_id} key={record.document_version_id}>{record.document_title || record.document_version_id}</option>)}
+              </select>
+              <select value={recordStatus} onChange={(event) => setRecordStatus(event.target.value)}>
+                <option value="">全部状态</option>
+                <option value="pending">待审核</option>
+                <option value="confirmed">已确认</option>
+                <option value="modified">已修改</option>
+                <option value="doubtful">标疑</option>
+                <option value="excluded">已排除</option>
+              </select>
+            </div>
+          </div>
+          <ErrorNotice error={records.error || review.error} />
+          {records.isLoading ? <LoadingPane /> : allRecords.length ? (
+            <div className="extraction-records">
+              {allRecords.map((record) => (
+                <article className={`extraction-record ${record.review_status}`} key={record.id}>
+                  <header>
+                    <span><strong>{record.field_display_name || record.field_key || '字段'}</strong><small>{record.document_title || record.sample_key} · 第 {record.page_no || '—'} 页</small></span>
+                    <StatusPill value={record.review_status} />
+                  </header>
+                  <div className="value-comparison">
+                    <div><span>原始值</span><strong>{record.raw_value ?? '—'}</strong></div>
+                    <div><span>解析值</span><strong>{String(record.parsed_value?.value ?? record.parsed_value?.text ?? '—')}</strong></div>
+                    <div><span>标准值</span><strong>{String(record.normalized_value?.value ?? '—')}</strong></div>
+                  </div>
+                  {record.evidence_text && <blockquote>{record.evidence_text}</blockquote>}
+                  <footer>
+                    {record.document_id && (
+                      <Link className="mini-button" to={`/app/projects/${projectId}/documents/${record.document_id}?page=${record.page_no || 1}`}>
+                        查看证据 <ChevronRight size={13} />
+                      </Link>
+                    )}
+                    <div>
+                      <button className="mini-button confirm" onClick={() => review.mutate({ record, review_status: 'confirmed' })}><CircleCheck size={13} /> 确认</button>
+                      <button className="mini-button" onClick={() => {
+                        const value = window.prompt('请输入修正后的标准值', String(record.normalized_value?.value ?? record.raw_value ?? ''))
+                        if (value !== null) review.mutate({ record, review_status: 'modified', normalizedValue: value })
+                      }}><Edit3 size={13} /> 修改</button>
+                      <button className="mini-button" onClick={() => review.mutate({ record, review_status: 'doubtful' })}>标疑</button>
+                      <button className="mini-button exclude" onClick={() => review.mutate({ record, review_status: 'excluded' })}><X size={13} /> 排除</button>
+                    </div>
+                  </footer>
+                </article>
+              ))}
+            </div>
+          ) : <EmptyInline text={selectedRunId ? '暂无符合筛选条件的抽取记录' : '请选择抽取运行'} />}
+        </section>
+      </div>
     </div>
   )
 }
 
 function DatasetsSection({ projectId }: { projectId: string }) {
   const queryClient = useQueryClient()
+  const navigate = useNavigate()
   const [name, setName] = useState('')
   const [runId, setRunId] = useState('')
   const datasets = useQuery({
@@ -1938,10 +2521,14 @@ function DatasetsSection({ projectId }: { projectId: string }) {
   })
   const create = useMutation({
     mutationFn: () => api.createDataset(projectId, name, runId),
-    onSuccess: () => {
+    onSuccess: async (accepted) => {
       setName('')
       setRunId('')
-      queryClient.invalidateQueries({ queryKey: ['datasets', projectId] })
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['datasets', projectId] }),
+        queryClient.invalidateQueries({ queryKey: ['jobs', projectId] }),
+      ])
+      navigate(`/app/projects/${projectId}/datasets/pending/versions/${accepted.resource_id}`)
     },
   })
   return (
@@ -1972,7 +2559,232 @@ function DatasetsSection({ projectId }: { projectId: string }) {
         </button>
       </form>
       <ErrorNotice error={create.error} />
-      <RecordsPanel records={datasets.data || []} loading={datasets.isLoading} empty="暂无数据资产" />
+      <section className="panel glass">
+        <PanelHeading eyebrow="数据资产" title={`${datasets.data?.length || 0} 个数据集`} />
+        {datasets.isLoading ? <LoadingPane /> : datasets.data?.length ? (
+          <div className="dataset-card-grid">
+            {datasets.data.map((dataset) => (
+              <Link
+                className="dataset-card"
+                key={dataset.id}
+                to={`/app/projects/${projectId}/datasets/${dataset.id}/versions/${dataset.latest_version_id}`}
+              >
+                <div><Database size={18} /><StatusPill value={dataset.latest_version_status} /></div>
+                <h3>{dataset.name}</h3>
+                <p>{dataset.description || '可信研究数据集'}</p>
+                <footer>
+                  <span>V{dataset.latest_version_no}</span>
+                  <span>{dataset.row_count} 行 · {dataset.field_count} 字段</span>
+                  <ChevronRight size={15} />
+                </footer>
+              </Link>
+            ))}
+          </div>
+        ) : <EmptyInline text="暂无数据资产" />}
+      </section>
+    </div>
+  )
+}
+
+function DatasetWorkbench({
+  projectId,
+  datasetId,
+  versionId,
+}: {
+  projectId: string
+  datasetId: string
+  versionId: string
+}) {
+  const queryClient = useQueryClient()
+  const navigate = useNavigate()
+  const [error, setError] = useState<unknown>(null)
+  const detail = useQuery({
+    queryKey: ['dataset-version', projectId, versionId],
+    queryFn: () => api.datasetVersion(projectId, versionId),
+    refetchInterval: (query) =>
+      query.state.data &&
+      query.state.data.version.status === 'draft' &&
+      query.state.data.rows.length === 0
+        ? 3_000
+        : false,
+  })
+  const versions = useQuery({
+    queryKey: ['dataset-versions', projectId, datasetId],
+    queryFn: () => api.datasetVersions(projectId, datasetId),
+    enabled: datasetId !== 'pending',
+  })
+  const invalidate = () =>
+    Promise.all([
+      queryClient.invalidateQueries({ queryKey: ['dataset-version', projectId, versionId] }),
+      queryClient.invalidateQueries({ queryKey: ['datasets', projectId] }),
+      queryClient.invalidateQueries({ queryKey: ['dataset-versions', projectId] }),
+    ])
+  const addField = useMutation({
+    mutationFn: () => {
+      const displayName = window.prompt('字段显示名称')
+      if (!displayName) throw new Error('已取消新增字段')
+      const fieldKey = window.prompt('字段键（英文、数字或下划线）', displayName.toLowerCase().replace(/\s+/g, '_'))
+      if (!fieldKey) throw new Error('字段键不能为空')
+      return api.addDatasetField(projectId, versionId, {
+        field_key: fieldKey,
+        display_name: displayName,
+        data_type: 'text',
+        semantic_role: 'feature',
+        is_required: false,
+        unit_id: null,
+      })
+    },
+    onSuccess: invalidate,
+    onError: setError,
+  })
+  const addRow = useMutation({
+    mutationFn: () => {
+      const key = window.prompt('新行标识', `row-${Date.now()}`)
+      if (!key) throw new Error('行标识不能为空')
+      return api.addDatasetRow(projectId, versionId, key)
+    },
+    onSuccess: invalidate,
+    onError: setError,
+  })
+  const updateCell = useMutation({
+    mutationFn: ({
+      rowId,
+      field,
+      cell,
+    }: {
+      rowId: string
+      field: Awaited<ReturnType<typeof api.datasetVersion>>['fields'][number]
+      cell?: Awaited<ReturnType<typeof api.datasetVersion>>['rows'][number]['cells'][string]
+    }) => {
+      const current = cell?.value_number ?? cell?.value_text ?? cell?.raw_value ?? ''
+      const value = window.prompt(`修改“${field.display_name}”`, String(current))
+      if (value === null) throw new Error('已取消修改')
+      const notes = window.prompt('备注（可留空）', cell?.notes || '')
+      const requestedStatus = window.prompt(
+        '审核状态：pending / confirmed / modified / doubtful',
+        cell?.review_status || 'modified',
+      )
+      const reviewStatus = ['pending', 'confirmed', 'modified', 'doubtful'].includes(
+        requestedStatus || '',
+      )
+        ? requestedStatus!
+        : 'modified'
+      return api.updateDatasetCell(projectId, versionId, rowId, field.id, {
+        ...(field.data_type === 'number'
+          ? { value_number: value === '' ? null : Number(value) }
+          : { value_text: value }),
+        is_missing: value === '',
+        review_status: reviewStatus,
+        notes: notes ?? cell?.notes ?? null,
+      })
+    },
+    onSuccess: invalidate,
+    onError: setError,
+  })
+  const deleteRow = useMutation({
+    mutationFn: (rowId: string) => api.deleteDatasetRow(projectId, versionId, rowId),
+    onSuccess: invalidate,
+    onError: setError,
+  })
+  const freeze = useMutation({
+    mutationFn: () => api.freezeDataset(projectId, versionId),
+    onSuccess: invalidate,
+    onError: setError,
+  })
+  const clone = useMutation({
+    mutationFn: () => api.cloneDataset(projectId, versionId, '基于冻结版本创建可编辑副本'),
+    onSuccess: (created) => {
+      const actualDatasetId = detail.data?.dataset.id || datasetId
+      navigate(`/app/projects/${projectId}/datasets/${actualDatasetId}/versions/${created.version_id}`)
+    },
+    onError: setError,
+  })
+
+  if (detail.isLoading) return <LoadingPane label="正在加载数据集版本" />
+  if (detail.error || !detail.data)
+    return <div className="workspace-content"><ErrorNotice error={detail.error} /></div>
+  const data = detail.data
+  const editable = data.version.status === 'draft'
+  const missingCount = data.rows.reduce(
+    (count, row) =>
+      count +
+      data.fields.filter((field) => field.is_required && (!row.cells[field.field_key] || row.cells[field.field_key].is_missing)).length,
+    0,
+  )
+  const doubtfulCount = data.rows.reduce(
+    (count, row) =>
+      count + Object.values(row.cells).filter((cell) => cell.review_status === 'doubtful').length,
+    0,
+  )
+
+  return (
+    <div className="workspace-content dataset-workbench">
+      <div className="detail-toolbar">
+        <Link className="back-link" to={`/app/projects/${projectId}/datasets`}><ArrowLeft size={16} /> 返回数据集</Link>
+        <div className="detail-actions">
+          {versions.data && (
+            <select value={versionId} onChange={(event) =>
+              navigate(`/app/projects/${projectId}/datasets/${data.dataset.id}/versions/${event.target.value}`)
+            }>
+              {versions.data.map((version) => <option value={version.id} key={version.id}>V{Number(version.version_no)} · {String(version.status)}</option>)}
+            </select>
+          )}
+          {editable && <button className="button button-secondary" onClick={() => addField.mutate()}><Plus size={14} /> 字段</button>}
+          {editable && <button className="button button-secondary" onClick={() => addRow.mutate()}><Plus size={14} /> 行</button>}
+          {editable && <button className="button button-primary" onClick={() => {
+            if (window.confirm(`冻结后不可修改。当前必填缺失 ${missingCount} 个、疑似值 ${doubtfulCount} 个，继续提交冻结校验？`)) freeze.mutate()
+          }}>冻结版本</button>}
+          {!editable && <button className="button button-secondary" onClick={() => clone.mutate()}><RotateCcw size={14} /> 克隆新版本</button>}
+          <button className="button button-secondary" onClick={() => api.downloadDataset(projectId, versionId, data.dataset.name).catch(setError)}><Download size={14} /> Excel</button>
+        </div>
+      </div>
+      <ErrorNotice error={error || freeze.error || clone.error} />
+      <section className="document-summary glass dataset-summary">
+        <div><span className="eyebrow">可信数据集版本</span><h2>{data.dataset.name}</h2><p>V{Number(data.version.version_no)} · {data.rows.length} 行 · {data.fields.length} 字段</p></div>
+        <StatusPill value={data.version.status} />
+      </section>
+      <div className="dataset-quality-strip">
+        <span className={missingCount ? 'warning' : 'ok'}>必填缺失 {missingCount}</span>
+        <span className={doubtfulCount ? 'warning' : 'ok'}>疑似值 {doubtfulCount}</span>
+        <span>内容哈希 {String(data.version.content_sha256 || '冻结后生成').slice(0, 16)}</span>
+      </div>
+      <section className="dataset-table-panel glass">
+        <div className="dataset-table-scroll">
+          <table className="dataset-table">
+            <thead><tr><th>行标识</th>{data.fields.map((field) => <th key={field.id}>{field.display_name}{field.is_required && <i>*</i>}<small>{field.data_type}</small></th>)}{editable && <th>操作</th>}</tr></thead>
+            <tbody>
+              {data.rows.map((row) => (
+                <tr key={row.id}>
+                  <th>{row.row_key}</th>
+                  {data.fields.map((field) => {
+                    const cell = row.cells[field.field_key]
+                    const value = cell?.value_number ?? cell?.value_text ?? cell?.raw_value ?? ''
+                    const missing = field.is_required && (!cell || cell.is_missing || value === '')
+                    return (
+                      <td
+                        key={field.id}
+                        className={`${missing ? 'missing' : ''} ${cell?.review_status === 'doubtful' ? 'doubtful' : ''}`}
+                        onDoubleClick={() => editable && updateCell.mutate({ rowId: row.id, field, cell })}
+                      >
+                        <span>{value === '' ? '—' : String(value)}</span>
+                        {cell?.notes && <small>{cell.notes}</small>}
+                        {cell?.evidence?.[0]?.document_id && (
+                          <Link to={`/app/projects/${projectId}/documents/${cell.evidence[0].document_id}?page=${cell.evidence[0].page_no || 1}`}>证据</Link>
+                        )}
+                      </td>
+                    )
+                  })}
+                  {editable && <td><button className="mini-button exclude" onClick={() => {
+                    if (window.confirm(`删除行“${row.row_key}”？`)) deleteRow.mutate(row.id)
+                  }}><Trash2 size={13} /></button></td>}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        {!data.rows.length && <EmptyInline text="该版本尚无数据行，构建任务可能仍在运行" />}
+        <p className="table-help">双击单元格可编辑；红色表示必填缺失，琥珀色表示疑似值。</p>
+      </section>
     </div>
   )
 }
@@ -2040,6 +2852,14 @@ function App() {
         />
         <Route
           path="/app/projects/:projectId/documents/:documentId"
+          element={
+            <RequireAuth>
+              <WorkspacePage />
+            </RequireAuth>
+          }
+        />
+        <Route
+          path="/app/projects/:projectId/datasets/:datasetId/versions/:datasetVersionId"
           element={
             <RequireAuth>
               <WorkspacePage />

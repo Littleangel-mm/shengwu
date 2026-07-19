@@ -34,6 +34,11 @@ def list_datasets(project_id: UUID, db: DbSession):
     return service(db).list_datasets(project_id)
 
 
+@router.get("/{project_id}/datasets/{dataset_id}/versions", response_model=list[dict[str, Any]])
+def list_dataset_versions(project_id: UUID, dataset_id: UUID, db: DbSession):
+    return service(db).list_versions(project_id, dataset_id)
+
+
 @router.get("/{project_id}/dataset-versions/{version_id}", response_model=dict[str, Any])
 def get_dataset_version(
     project_id: UUID, version_id: UUID, db: DbSession, offset: int = 0, limit: int = 200

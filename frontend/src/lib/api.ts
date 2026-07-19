@@ -197,6 +197,162 @@ export type SearchResult = GenericRecord & {
   is_included: boolean
 }
 
+export type TermCategory = {
+  id: string
+  project_id: string
+  code: string
+  name: string
+  description?: string | null
+  position?: number
+}
+
+export type Term = GenericRecord & {
+  category_id: string
+  canonical_name: string
+  definition?: string | null
+  language?: string | null
+  data_type?: string | null
+  semantic_role?: string | null
+  status: string
+  is_selected: boolean
+  include_in_model: boolean
+  include_in_score: boolean
+  indicator_direction?: string | null
+  aliases: Array<{ id?: string; alias_text: string } | string>
+}
+
+export type UnitItem = {
+  id: string
+  code: string
+  name: string
+  symbol?: string | null
+  dimension?: string | null
+}
+
+export type FieldDefinition = {
+  id?: string
+  field_key: string
+  display_name: string
+  source_term_id?: string | null
+  category_code?: string | null
+  semantic_role: string
+  data_type: 'text' | 'number' | 'boolean' | 'date' | 'category' | 'range'
+  preferred_unit_id?: string | null
+  indicator_direction?: string | null
+  is_required: boolean
+  is_identifier: boolean
+  include_in_model: boolean
+  include_in_score: boolean
+  extraction_config: Record<string, unknown>
+  validation_rules: Record<string, unknown>
+}
+
+export type FieldSchema = GenericRecord & {
+  name: string
+  version_no: number
+  status: string
+  source_search_run_id?: string | null
+  settings: Record<string, unknown>
+  fields?: FieldDefinition[]
+}
+
+export type ExtractionRun = GenericRecord & {
+  name?: string | null
+  field_schema_id: string
+  search_run_id?: string | null
+  status: string
+  record_count?: number
+  created_at: string
+}
+
+export type ExtractionRecord = GenericRecord & {
+  extraction_run_id: string
+  field_definition_id: string
+  field_key?: string
+  field_display_name?: string
+  document_id?: string
+  document_title?: string | null
+  document_version_id: string
+  page_no?: number | null
+  bbox?: number[] | null
+  evidence_text?: string | null
+  sample_key: string
+  group_key?: string | null
+  timepoint_key?: string | null
+  raw_value?: string | null
+  parsed_value: Record<string, unknown>
+  normalized_value: Record<string, unknown>
+  ml_value: Record<string, unknown>
+  confidence?: number | null
+  review_status: 'pending' | 'confirmed' | 'modified' | 'doubtful' | 'excluded'
+  notes?: string | null
+}
+
+export type DatasetSummary = GenericRecord & {
+  name: string
+  description?: string | null
+  latest_version_id: string
+  latest_version_no: number
+  latest_version_status: string
+  row_count: number
+  field_count: number
+}
+
+export type DatasetField = {
+  id: string
+  field_key: string
+  display_name: string
+  data_type: string
+  semantic_role: string
+  unit_id?: string | null
+  is_required: boolean
+  position: number
+}
+
+export type DatasetCell = GenericRecord & {
+  field_id: string
+  raw_value?: string | null
+  value_text?: string | null
+  value_number?: number | null
+  value_boolean?: boolean | null
+  value_date?: string | null
+  normalized_value?: Record<string, unknown> | null
+  ml_value?: Record<string, unknown> | null
+  unit_id?: string | null
+  review_status: string
+  is_missing: boolean
+  notes?: string | null
+  evidence?: Array<{
+    id: string
+    document_id?: string
+    page_no?: number | null
+    evidence_text?: string | null
+    bbox?: number[] | null
+  }>
+}
+
+export type DatasetVersionDetail = {
+  dataset: DatasetSummary
+  version: GenericRecord & {
+    dataset_id: string
+    version_no: number
+    status: string
+    row_count: number
+    field_count: number
+  }
+  fields: DatasetField[]
+  rows: Array<
+    GenericRecord & {
+      row_no: number
+      row_key: string
+      source_document_id?: string | null
+      cells: Record<string, DatasetCell>
+    }
+  >
+  offset: number
+  limit: number
+}
+
 export class ApiError extends Error {
   status: number
   code: string
@@ -265,6 +421,15 @@ async function authorizedBlob(path: string): Promise<Blob> {
     throw new ApiError(response.status, 'download_failed', '文件读取失败')
   }
   return response.blob()
+}
+
+async function downloadBlob(path: string, filename: string) {
+  const blobUrl = URL.createObjectURL(await authorizedBlob(path))
+  const anchor = document.createElement('a')
+  anchor.href = blobUrl
+  anchor.download = filename
+  anchor.click()
+  URL.revokeObjectURL(blobUrl)
 }
 
 export const api = {
@@ -373,12 +538,86 @@ export const api = {
       `/projects/${projectId}/search-runs/${runId}/results/${resultId}`,
       { method: 'PATCH', body: json(payload) },
     ),
-  terms: (projectId: string) =>
-    request<ListResponse<GenericRecord>>(`/projects/${projectId}/terms?limit=200`),
+  termCategories: (projectId: string) =>
+    request<TermCategory[]>(`/projects/${projectId}/term-categories`),
+  createTermCategory: (projectId: string, payload: { code: string; name: string; description?: string }) =>
+    request<TermCategory>(`/projects/${projectId}/term-categories`, {
+      method: 'POST',
+      body: json(payload),
+    }),
+  updateTermCategory: (projectId: string, categoryId: string, payload: Partial<TermCategory>) =>
+    request<TermCategory>(`/projects/${projectId}/term-categories/${categoryId}`, {
+      method: 'PATCH',
+      body: json(payload),
+    }),
+  deleteTermCategory: (projectId: string, categoryId: string) =>
+    request<void>(`/projects/${projectId}/term-categories/${categoryId}`, { method: 'DELETE' }),
+  terms: (projectId: string, categoryId?: string, status?: string) => {
+    const params = new URLSearchParams({ limit: '500' })
+    if (categoryId) params.set('category_id', categoryId)
+    if (status) params.set('status', status)
+    return request<ListResponse<Term>>(`/projects/${projectId}/terms?${params}`)
+  },
+  term: (projectId: string, termId: string) =>
+    request<Term>(`/projects/${projectId}/terms/${termId}`),
+  createTerm: (projectId: string, payload: Omit<Term, 'id' | 'project_id' | 'include_in_model' | 'include_in_score'>) =>
+    request<Term>(`/projects/${projectId}/terms`, { method: 'POST', body: json(payload) }),
+  updateTerm: (projectId: string, termId: string, payload: Partial<Term> & { aliases?: string[] }) =>
+    request<Term>(`/projects/${projectId}/terms/${termId}`, {
+      method: 'PATCH',
+      body: json(payload),
+    }),
+  deleteTerm: (projectId: string, termId: string) =>
+    request<Record<string, unknown>>(`/projects/${projectId}/terms/${termId}`, {
+      method: 'DELETE',
+    }),
+  mergeTerms: (projectId: string, targetTermId: string, sourceTermIds: string[], reason?: string) =>
+    request<Term>(`/projects/${projectId}/terms/merge`, {
+      method: 'POST',
+      body: json({ target_term_id: targetTermId, source_term_ids: sourceTermIds, reason }),
+    }),
+  splitTerm: (
+    projectId: string,
+    termId: string,
+    children: Array<{ category_id: string; canonical_name: string; aliases: string[] }>,
+  ) =>
+    request<Term[]>(`/projects/${projectId}/terms/${termId}/split`, {
+      method: 'POST',
+      body: json({ children }),
+    }),
+  discoverTerms: (projectId: string, searchRunId: string) =>
+    request<TaskAccepted>(`/projects/${projectId}/term-discovery`, {
+      method: 'POST',
+      body: json({ search_run_id: searchRunId, min_occurrences: 2, max_candidates: 500 }),
+    }),
   fieldSchemas: (projectId: string) =>
-    request<GenericRecord[]>(`/projects/${projectId}/field-schemas`),
+    request<FieldSchema[]>(`/projects/${projectId}/field-schemas`),
+  fieldSchema: (projectId: string, schemaId: string) =>
+    request<FieldSchema>(`/projects/${projectId}/field-schemas/${schemaId}`),
+  createFieldSchema: (
+    projectId: string,
+    payload: { name: string; source_search_run_id?: string | null; fields: FieldDefinition[]; settings: Record<string, unknown> },
+  ) =>
+    request<FieldSchema>(`/projects/${projectId}/field-schemas`, {
+      method: 'POST',
+      body: json(payload),
+    }),
+  updateFieldSchema: (
+    projectId: string,
+    schemaId: string,
+    payload: { name: string; source_search_run_id?: string | null; fields: FieldDefinition[]; settings: Record<string, unknown> },
+  ) =>
+    request<FieldSchema>(`/projects/${projectId}/field-schemas/${schemaId}`, {
+      method: 'PATCH',
+      body: json(payload),
+    }),
+  freezeFieldSchema: (projectId: string, schemaId: string) =>
+    request<FieldSchema>(`/projects/${projectId}/field-schemas/${schemaId}/freeze`, {
+      method: 'POST',
+    }),
+  units: () => request<UnitItem[]>('/units'),
   extractions: (projectId: string) =>
-    request<GenericRecord[]>(`/projects/${projectId}/extraction-runs`),
+    request<ExtractionRun[]>(`/projects/${projectId}/extraction-runs`),
   createExtraction: (projectId: string, fieldSchemaId: string, searchRunId?: string) =>
     request<TaskAccepted>(`/projects/${projectId}/extraction-runs`, {
       method: 'POST',
@@ -388,13 +627,100 @@ export const api = {
         search_run_id: searchRunId || null,
       }),
     }),
+  extractionRecords: (
+    projectId: string,
+    runId: string,
+    filters: { field_definition_id?: string; document_version_id?: string; review_status?: string } = {},
+  ) => {
+    const params = new URLSearchParams({ limit: '500' })
+    Object.entries(filters).forEach(([key, value]) => value && params.set(key, value))
+    return request<ListResponse<ExtractionRecord>>(
+      `/projects/${projectId}/extraction-runs/${runId}/records?${params}`,
+    )
+  },
+  extractionSummary: (projectId: string, runId: string) =>
+    request<{
+      extraction_run_id: string
+      status: string
+      total_records: number
+      field_count: number
+      document_count: number
+      review_status_counts: Record<string, number>
+    }>(`/projects/${projectId}/extraction-runs/${runId}/summary`),
+  reviewExtractionRecord: (
+    projectId: string,
+    runId: string,
+    recordId: string,
+    payload: {
+      review_status: ExtractionRecord['review_status']
+      normalized_value?: Record<string, unknown>
+      ml_value?: Record<string, unknown>
+      notes?: string
+    },
+  ) =>
+    request<ExtractionRecord>(
+      `/projects/${projectId}/extraction-runs/${runId}/records/${recordId}`,
+      { method: 'PATCH', body: json(payload) },
+    ),
   datasets: (projectId: string) =>
-    request<GenericRecord[]>(`/projects/${projectId}/datasets`),
+    request<DatasetSummary[]>(`/projects/${projectId}/datasets`),
   createDataset: (projectId: string, name: string, extractionRunId: string) =>
     request<TaskAccepted>(`/projects/${projectId}/datasets/from-extraction`, {
       method: 'POST',
       body: json({ name, extraction_run_id: extractionRunId }),
     }),
+  datasetVersions: (projectId: string, datasetId: string) =>
+    request<Array<DatasetVersionDetail['version']>>(
+      `/projects/${projectId}/datasets/${datasetId}/versions`,
+    ),
+  datasetVersion: (projectId: string, versionId: string) =>
+    request<DatasetVersionDetail>(
+      `/projects/${projectId}/dataset-versions/${versionId}?offset=0&limit=1000`,
+    ),
+  addDatasetField: (
+    projectId: string,
+    versionId: string,
+    payload: Omit<DatasetField, 'id' | 'position'>,
+  ) =>
+    request<DatasetField>(`/projects/${projectId}/dataset-versions/${versionId}/fields`, {
+      method: 'POST',
+      body: json(payload),
+    }),
+  addDatasetRow: (projectId: string, versionId: string, rowKey: string) =>
+    request<GenericRecord>(`/projects/${projectId}/dataset-versions/${versionId}/rows`, {
+      method: 'POST',
+      body: json({ row_key: rowKey, metadata: {} }),
+    }),
+  updateDatasetCell: (
+    projectId: string,
+    versionId: string,
+    rowId: string,
+    fieldId: string,
+    payload: Partial<DatasetCell>,
+  ) =>
+    request<DatasetCell>(
+      `/projects/${projectId}/dataset-versions/${versionId}/rows/${rowId}/cells/${fieldId}`,
+      { method: 'PATCH', body: json(payload) },
+    ),
+  deleteDatasetRow: (projectId: string, versionId: string, rowId: string) =>
+    request<void>(`/projects/${projectId}/dataset-versions/${versionId}/rows/${rowId}`, {
+      method: 'DELETE',
+    }),
+  freezeDataset: (projectId: string, versionId: string) =>
+    request<DatasetVersionDetail['version']>(
+      `/projects/${projectId}/dataset-versions/${versionId}/freeze`,
+      { method: 'POST' },
+    ),
+  cloneDataset: (projectId: string, versionId: string, changeSummary: string) =>
+    request<{ version_id: string; version_no: number; status: string }>(
+      `/projects/${projectId}/dataset-versions/${versionId}/clone`,
+      { method: 'POST', body: json({ change_summary: changeSummary }) },
+    ),
+  downloadDataset: (projectId: string, versionId: string, name: string) =>
+    downloadBlob(
+      `/projects/${projectId}/dataset-versions/${versionId}/export.xlsx`,
+      `${name || 'dataset'}.xlsx`,
+    ),
   mlRuns: (projectId: string) =>
     request<GenericRecord[]>(`/projects/${projectId}/ml-runs`),
   optimization: (projectId: string, runId: string) =>

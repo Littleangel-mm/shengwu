@@ -388,6 +388,22 @@ def test_complete_backend_workflow() -> None:
             headers=headers,
         )
     )
+    versions = checked(
+        client.get(
+            f"/api/v1/projects/{project_id}/datasets/{version['dataset']['id']}/versions",
+            headers=headers,
+        )
+    )
+    assert [item["version_no"] for item in versions] == [1]
+    evidence_cells = [
+        cell
+        for row in version["rows"]
+        for cell in row["cells"].values()
+        if cell["evidence"]
+    ]
+    assert evidence_cells
+    assert evidence_cells[0]["evidence"][0]["document_id"]
+    assert evidence_cells[0]["evidence"][0]["page_no"] > 0
     checked(
         client.post(
             f"/api/v1/projects/{project_id}/dataset-versions/{dataset['resource_id']}/freeze",
@@ -403,6 +419,19 @@ def test_complete_backend_workflow() -> None:
         201,
     )
     assert cloned["version_no"] == 2
+    versions = checked(
+        client.get(
+            f"/api/v1/projects/{project_id}/datasets/{version['dataset']['id']}/versions",
+            headers=headers,
+        )
+    )
+    assert [item["version_no"] for item in versions] == [2, 1]
+    assert (
+        client.get(
+            f"/api/v1/projects/{project_id}/dataset-versions/{dataset['resource_id']}/export.xlsx"
+        ).status_code
+        == 401
+    )
     exported = client.get(
         f"/api/v1/projects/{project_id}/dataset-versions/{dataset['resource_id']}/export.xlsx",
         headers=headers,

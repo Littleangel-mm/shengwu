@@ -7,7 +7,7 @@ from uuid import UUID
 
 import jieba
 from fastapi.encoders import jsonable_encoder
-from sqlalchemy import func, insert, select, update
+from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.orm import Session
 
 from app.core.errors import AppError
@@ -15,8 +15,10 @@ from app.db.tables import table
 from app.models import ProcessingJob
 from app.schemas.workflow import (
     FieldSchemaCreate,
+    FieldSchemaUpdate,
     TaskAccepted,
     TermCategoryCreate,
+    TermCategoryUpdate,
     TermCreate,
     TermDiscoveryCreate,
     TermMerge,
@@ -82,6 +84,69 @@ class TermService:
                 .order_by(categories.c.position, categories.c.name)
             ).mappings()
         ]
+
+    def update_category(
+        self, project_id: UUID, category_id: UUID, payload: TermCategoryUpdate
+    ) -> dict:
+        categories = table(self.db, "term_categories")
+        values = payload.model_dump(exclude_unset=True)
+        if not values:
+            row = self.db.execute(
+                select(categories).where(
+                    categories.c.id == category_id,
+                    categories.c.project_id == project_id,
+                )
+            ).mappings().one_or_none()
+        else:
+            row = (
+                self.db.execute(
+                    update(categories)
+                    .where(
+                        categories.c.id == category_id,
+                        categories.c.project_id == project_id,
+                    )
+                    .values(**values)
+                    .returning(categories)
+                )
+                .mappings()
+                .one_or_none()
+            )
+        if not row:
+            raise AppError(code="term_category_not_found", message="术语分类不存在", status_code=404)
+        self.db.commit()
+        return dict(row)
+
+    def delete_category(self, project_id: UUID, category_id: UUID) -> dict:
+        categories = table(self.db, "term_categories")
+        terms = table(self.db, "terms")
+        category_exists = self.db.scalar(
+            select(categories.c.id).where(
+                categories.c.id == category_id,
+                categories.c.project_id == project_id,
+            )
+        )
+        if not category_exists:
+            raise AppError(code="term_category_not_found", message="术语分类不存在", status_code=404)
+        term_count = (
+            self.db.scalar(
+                select(func.count()).select_from(terms).where(terms.c.category_id == category_id)
+            )
+            or 0
+        )
+        if term_count:
+            raise AppError(
+                code="term_category_in_use",
+                message="术语分类仍被术语使用，无法删除",
+                status_code=409,
+            )
+        self.db.execute(
+            delete(categories).where(
+                categories.c.id == category_id,
+                categories.c.project_id == project_id,
+            )
+        )
+        self.db.commit()
+        return {"id": category_id, "status": "deleted"}
 
     def create_term(self, project_id: UUID, payload: TermCreate, actor_id: UUID | None) -> dict:
         terms = table(self.db, "terms")
@@ -149,12 +214,23 @@ class TermService:
         return result
 
     def list_terms(
-        self, project_id: UUID, category_id: UUID | None, offset: int, limit: int
+        self,
+        project_id: UUID,
+        category_id: UUID | None,
+        status: str | None,
+        is_selected: bool | None,
+        offset: int,
+        limit: int,
     ) -> tuple[list[dict], int]:
         terms = table(self.db, "terms")
+        aliases = table(self.db, "term_aliases")
         filters = [terms.c.project_id == project_id, terms.c.deleted_at.is_(None)]
         if category_id:
             filters.append(terms.c.category_id == category_id)
+        if status is not None:
+            filters.append(terms.c.status == status)
+        if is_selected is not None:
+            filters.append(terms.c.is_selected == is_selected)
         total = self.db.scalar(select(func.count()).select_from(terms).where(*filters)) or 0
         rows = (
             self.db.execute(
@@ -167,31 +243,84 @@ class TermService:
             .mappings()
             .all()
         )
-        return [dict(row) for row in rows], total
+        items = [dict(row) for row in rows]
+        aliases_by_term: dict[UUID, list[dict]] = {item["id"]: [] for item in items}
+        if aliases_by_term:
+            for alias in self.db.execute(
+                select(aliases)
+                .where(aliases.c.term_id.in_(aliases_by_term))
+                .order_by(aliases.c.created_at)
+            ).mappings():
+                aliases_by_term[alias["term_id"]].append(dict(alias))
+        for item in items:
+            item["aliases"] = aliases_by_term[item["id"]]
+        return items, total
 
-    def update_term(self, project_id: UUID, term_id: UUID, payload: TermUpdate) -> dict:
+    def update_term(
+        self,
+        project_id: UUID,
+        term_id: UUID,
+        payload: TermUpdate,
+        actor_id: UUID | None,
+    ) -> dict:
         terms = table(self.db, "terms")
+        categories = table(self.db, "term_categories")
+        aliases = table(self.db, "term_aliases")
+        self.get_term(project_id, term_id)
         values = payload.model_dump(exclude_unset=True)
+        alias_values = values.pop("aliases", None)
         if "canonical_name" in values:
+            values["canonical_name"] = values["canonical_name"].strip()
             values["normalized_name"] = values["canonical_name"].casefold().strip()
-        row = (
-            self.db.execute(
-                update(terms)
-                .where(
-                    terms.c.id == term_id,
-                    terms.c.project_id == project_id,
-                    terms.c.deleted_at.is_(None),
+        if "category_id" in values:
+            category_exists = self.db.scalar(
+                select(categories.c.id).where(
+                    categories.c.id == values["category_id"],
+                    categories.c.project_id == project_id,
                 )
-                .values(**values)
-                .returning(terms)
             )
-            .mappings()
-            .one_or_none()
-        )
-        if not row:
-            raise AppError(code="term_not_found", message="词元不存在", status_code=404)
-        self.db.commit()
-        return dict(row)
+            if not category_exists:
+                raise AppError(
+                    code="term_category_not_found", message="术语分类不存在", status_code=422
+                )
+        try:
+            if values:
+                self.db.execute(
+                    update(terms)
+                    .where(
+                        terms.c.id == term_id,
+                        terms.c.project_id == project_id,
+                        terms.c.deleted_at.is_(None),
+                    )
+                    .values(**values)
+                )
+            if alias_values is not None:
+                self.db.execute(delete(aliases).where(aliases.c.term_id == term_id))
+                unique_aliases: dict[str, str] = {}
+                for value in alias_values:
+                    stripped = value.strip()
+                    if stripped:
+                        unique_aliases.setdefault(stripped.casefold(), stripped)
+                if unique_aliases:
+                    self.db.execute(
+                        insert(aliases),
+                        [
+                            {
+                                "term_id": term_id,
+                                "alias_text": value,
+                                "normalized_alias": normalized,
+                                "source": "manual",
+                                "status": "confirmed",
+                                "created_by": actor_id,
+                            }
+                            for normalized, value in unique_aliases.items()
+                        ],
+                    )
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+        return self.get_term(project_id, term_id)
 
     def delete_term(self, project_id: UUID, term_id: UUID, actor_id: UUID | None) -> dict:
         terms = table(self.db, "terms")
@@ -377,8 +506,22 @@ class TermService:
             values.append(value)
         return values
 
+    @staticmethod
+    def _discovery_candidates(
+        counter: Counter[str], min_occurrences: int, max_candidates: int
+    ) -> list[tuple[str, int]]:
+        return [
+            (token, count)
+            for token, count in counter.most_common(max_candidates)
+            if count >= min_occurrences
+        ]
+
     def discover(
-        self, search_run_id: UUID, progress: Callable[[float, str], None]
+        self,
+        search_run_id: UUID,
+        progress: Callable[[float, str], None],
+        min_occurrences: int = 2,
+        max_candidates: int = 500,
     ) -> dict[str, Any]:
         runs = table(self.db, "search_runs")
         results = table(self.db, "search_results")
@@ -428,10 +571,7 @@ class TermService:
                 )
                 .returning(categories.c.id)
             ).scalar_one()
-        min_count = 2
-        candidates = [
-            (token, count) for token, count in counter.most_common(500) if count >= min_count
-        ]
+        candidates = self._discovery_candidates(counter, min_occurrences, max_candidates)
         created = 0
         for index, (token, count) in enumerate(candidates):
             term_id = self.db.scalar(
@@ -489,11 +629,67 @@ class TermService:
             "created_count": created,
         }
 
+    @staticmethod
+    def _field_values(schema_id: UUID, item: Any, position: int) -> dict[str, Any]:
+        return {
+            "field_schema_id": schema_id,
+            "source_term_id": item.source_term_id,
+            "field_key": item.field_key,
+            "display_name": item.display_name,
+            "category_code": item.category_code,
+            "semantic_role": item.semantic_role,
+            "data_type": item.data_type,
+            "preferred_unit_id": item.preferred_unit_id,
+            "indicator_direction": item.indicator_direction,
+            "is_required": item.is_required,
+            "is_identifier": item.is_identifier,
+            "include_in_model": item.include_in_model,
+            "include_in_score": item.include_in_score,
+            "position": position,
+            "extraction_config": item.extraction_config,
+            "validation_rules": item.validation_rules,
+            "display_config": {},
+        }
+
+    def _validate_field_sources(self, project_id: UUID, source_ids: set[UUID]) -> None:
+        if not source_ids:
+            return
+        terms = table(self.db, "terms")
+        valid_ids = set(
+            self.db.scalars(
+                select(terms.c.id).where(
+                    terms.c.id.in_(source_ids),
+                    terms.c.project_id == project_id,
+                    terms.c.deleted_at.is_(None),
+                )
+            ).all()
+        )
+        if valid_ids != source_ids:
+            raise AppError(
+                code="field_source_term_invalid",
+                message="字段引用的术语不存在或不属于当前项目",
+                status_code=422,
+            )
+
+    def _validate_field_inputs(self, project_id: UUID, field_items: list[Any]) -> None:
+        field_keys = [item.field_key for item in field_items]
+        if len(field_keys) != len(set(field_keys)):
+            raise AppError(
+                code="field_key_duplicate",
+                message="字段标识 field_key 必须唯一",
+                status_code=422,
+            )
+        self._validate_field_sources(
+            project_id,
+            {item.source_term_id for item in field_items if item.source_term_id is not None},
+        )
+
     def create_field_schema(
         self, project_id: UUID, payload: FieldSchemaCreate, actor_id: UUID | None
     ) -> dict:
         schemas = table(self.db, "field_schemas")
         fields = table(self.db, "field_definitions")
+        self._validate_field_inputs(project_id, payload.fields)
         version_no = (
             self.db.scalar(
                 select(func.max(schemas.c.version_no)).where(schemas.c.project_id == project_id)
@@ -516,25 +712,7 @@ class TermService:
         self.db.execute(
             insert(fields),
             [
-                {
-                    "field_schema_id": schema_id,
-                    "source_term_id": item.source_term_id,
-                    "field_key": item.field_key,
-                    "display_name": item.display_name,
-                    "category_code": item.category_code,
-                    "semantic_role": item.semantic_role,
-                    "data_type": item.data_type,
-                    "preferred_unit_id": item.preferred_unit_id,
-                    "indicator_direction": item.indicator_direction,
-                    "is_required": item.is_required,
-                    "is_identifier": item.is_identifier,
-                    "include_in_model": item.include_in_model,
-                    "include_in_score": item.include_in_score,
-                    "position": index,
-                    "extraction_config": item.extraction_config,
-                    "validation_rules": item.validation_rules,
-                    "display_config": {},
-                }
+                self._field_values(schema_id, item, index)
                 for index, item in enumerate(payload.fields)
             ],
         )
@@ -575,8 +753,96 @@ class TermService:
             ).mappings()
         ]
 
+    def update_field_schema(
+        self, project_id: UUID, schema_id: UUID, payload: FieldSchemaUpdate
+    ) -> dict:
+        schemas = table(self.db, "field_schemas")
+        fields = table(self.db, "field_definitions")
+        schema_status = self.db.scalar(
+            select(schemas.c.status).where(
+                schemas.c.id == schema_id,
+                schemas.c.project_id == project_id,
+            )
+        )
+        if schema_status is None:
+            raise AppError(code="field_schema_not_found", message="字段方案不存在", status_code=404)
+        if schema_status != "draft":
+            raise AppError(
+                code="field_schema_frozen",
+                message="已冻结的字段方案禁止修改",
+                status_code=409,
+            )
+        self._validate_field_inputs(project_id, payload.fields)
+        try:
+            updated_id = self.db.scalar(
+                update(schemas)
+                .where(
+                    schemas.c.id == schema_id,
+                    schemas.c.project_id == project_id,
+                    schemas.c.status == "draft",
+                )
+                .values(name=payload.name, settings=payload.settings)
+                .returning(schemas.c.id)
+            )
+            if not updated_id:
+                raise AppError(
+                    code="field_schema_frozen",
+                    message="已冻结的字段方案禁止修改",
+                    status_code=409,
+                )
+            self.db.execute(delete(fields).where(fields.c.field_schema_id == schema_id))
+            self.db.execute(
+                insert(fields),
+                [
+                    self._field_values(schema_id, item, index)
+                    for index, item in enumerate(payload.fields)
+                ],
+            )
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+        return self.get_field_schema(project_id, schema_id)
+
     def freeze_field_schema(self, project_id: UUID, schema_id: UUID, actor_id: UUID | None) -> dict:
         schemas = table(self.db, "field_schemas")
+        fields = table(self.db, "field_definitions")
+        existing_status = self.db.scalar(
+            select(schemas.c.status).where(
+                schemas.c.id == schema_id,
+                schemas.c.project_id == project_id,
+            )
+        )
+        if existing_status is None:
+            raise AppError(code="field_schema_not_found", message="字段方案不存在", status_code=404)
+        if existing_status != "draft":
+            raise AppError(
+                code="field_schema_not_freezable",
+                message="字段方案已冻结",
+                status_code=409,
+            )
+        field_rows = self.db.execute(
+            select(fields.c.field_key, fields.c.source_term_id).where(
+                fields.c.field_schema_id == schema_id
+            )
+        ).mappings().all()
+        if not field_rows:
+            raise AppError(
+                code="field_schema_empty",
+                message="字段方案至少需要一个字段才能冻结",
+                status_code=422,
+            )
+        field_keys = [row["field_key"] for row in field_rows]
+        if len(field_keys) != len(set(field_keys)):
+            raise AppError(
+                code="field_key_duplicate",
+                message="字段标识 field_key 必须唯一",
+                status_code=422,
+            )
+        self._validate_field_sources(
+            project_id,
+            {row["source_term_id"] for row in field_rows if row["source_term_id"] is not None},
+        )
         row = (
             self.db.execute(
                 update(schemas)

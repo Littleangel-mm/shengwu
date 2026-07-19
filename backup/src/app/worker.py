@@ -193,7 +193,12 @@ class JobWorker:
         if job.job_type == "discover_terms":
             from app.services.term import TermService
 
-            return TermService(db).discover(UUID(job.requested_config["search_run_id"]), progress)
+            return TermService(db).discover(
+                UUID(job.requested_config["search_run_id"]),
+                progress,
+                min_occurrences=int(job.requested_config.get("min_occurrences", 2)),
+                max_candidates=int(job.requested_config.get("max_candidates", 500)),
+            )
         if job.job_type == "run_extraction":
             from app.services.extraction import ExtractionService
 

@@ -7,8 +7,10 @@ from app.api.deps import ActorId, DbSession
 from app.schemas.common import ListResponse
 from app.schemas.workflow import (
     FieldSchemaCreate,
+    FieldSchemaUpdate,
     TaskAccepted,
     TermCategoryCreate,
+    TermCategoryUpdate,
     TermCreate,
     TermDiscoveryCreate,
     TermMerge,
@@ -30,6 +32,18 @@ def list_categories(project_id: UUID, db: DbSession):
     return TermService(db).list_categories(project_id)
 
 
+@router.patch("/{project_id}/term-categories/{category_id}", response_model=dict[str, Any])
+def update_category(
+    project_id: UUID, category_id: UUID, payload: TermCategoryUpdate, db: DbSession
+):
+    return TermService(db).update_category(project_id, category_id, payload)
+
+
+@router.delete("/{project_id}/term-categories/{category_id}", response_model=dict[str, Any])
+def delete_category(project_id: UUID, category_id: UUID, db: DbSession):
+    return TermService(db).delete_category(project_id, category_id)
+
+
 @router.post("/{project_id}/terms", response_model=dict[str, Any], status_code=201)
 def create_term(project_id: UUID, payload: TermCreate, db: DbSession, actor_id: ActorId):
     return TermService(db).create_term(project_id, payload, actor_id)
@@ -40,16 +54,27 @@ def list_terms(
     project_id: UUID,
     db: DbSession,
     category_id: UUID | None = None,
+    status: str | None = Query(default=None, max_length=32),
+    is_selected: bool | None = None,
     offset: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=500),
 ):
-    items, total = TermService(db).list_terms(project_id, category_id, offset, limit)
+    items, total = TermService(db).list_terms(
+        project_id, category_id, status, is_selected, offset, limit
+    )
     return ListResponse(items=items, total=total, offset=offset, limit=limit)
 
 
+@router.get("/{project_id}/terms/{term_id}", response_model=dict[str, Any])
+def get_term(project_id: UUID, term_id: UUID, db: DbSession):
+    return TermService(db).get_term(project_id, term_id)
+
+
 @router.patch("/{project_id}/terms/{term_id}", response_model=dict[str, Any])
-def update_term(project_id: UUID, term_id: UUID, payload: TermUpdate, db: DbSession):
-    return TermService(db).update_term(project_id, term_id, payload)
+def update_term(
+    project_id: UUID, term_id: UUID, payload: TermUpdate, db: DbSession, actor_id: ActorId
+):
+    return TermService(db).update_term(project_id, term_id, payload, actor_id)
 
 
 @router.delete("/{project_id}/terms/{term_id}", response_model=dict[str, Any])
@@ -95,6 +120,16 @@ def list_field_schemas(project_id: UUID, db: DbSession):
 @router.get("/{project_id}/field-schemas/{schema_id}", response_model=dict[str, Any])
 def get_field_schema(project_id: UUID, schema_id: UUID, db: DbSession):
     return TermService(db).get_field_schema(project_id, schema_id)
+
+
+@router.patch("/{project_id}/field-schemas/{schema_id}", response_model=dict[str, Any])
+def update_field_schema(
+    project_id: UUID,
+    schema_id: UUID,
+    payload: FieldSchemaUpdate,
+    db: DbSession,
+):
+    return TermService(db).update_field_schema(project_id, schema_id, payload)
 
 
 @router.post("/{project_id}/field-schemas/{schema_id}/freeze", response_model=dict[str, Any])

@@ -1,0 +1,76 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "research-platform-api"
+version = "0.1.0"
+description = "FastAPI backend for the generic research document platform"
+requires-python = ">=3.11,<3.15"
+dependencies = [
+    "fastapi>=0.115,<1.0",
+    "uvicorn[standard]>=0.32,<1.0",
+    "pydantic>=2.10,<3.0",
+    "pydantic-settings>=2.14.2,<3.0",
+    "SQLAlchemy>=2.0.36,<3.0",
+    "psycopg2-binary>=2.9.10,<3.0",
+    "python-multipart>=0.0.31,<1.0",
+    "httpx>=0.28,<1.0",
+    "PyMuPDF>=1.25,<2.0",
+    "python-docx>=1.1,<2.0",
+    "openpyxl>=3.1,<4.0",
+    "pandas>=2.2,<4.0",
+    "matplotlib>=3.10,<4.0",
+    "scikit-learn>=1.6,<2.0",
+    "xgboost>=3.0,<4.0",
+    "shap>=0.48,<1.0",
+    "joblib>=1.4,<2.0",
+    "RapidFuzz>=3.11,<4.0",
+    "jieba>=0.42,<1.0",
+    "email-validator>=2.2,<3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx>=0.28,<1.0",
+    "pytest>=8.3,<9.0",
+    "pytest-cov>=6.0,<7.0",
+    "ruff>=0.9,<1.0",
+    "mypy>=1.15,<2.0",
+    "pip-audit>=2.9,<3.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.coverage.run]
+source = ["app"]
+branch = true
+omit = ["app/ocr_runner.py"]
+
+[tool.coverage.report]
+fail_under = 70
+show_missing = true
+skip_covered = true
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501", "B008"]
+
+[tool.mypy]
+python_version = "3.11"
+plugins = ["pydantic.mypy"]
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_unused_ignores = true
+exclude = ["data"]

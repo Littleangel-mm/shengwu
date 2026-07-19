@@ -1,0 +1,41 @@
+# Local secrets and environment overrides
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Customer source material and local specifications
+/*.pdf
+/*.docx
+/fermentation_literature_ml_system_design.md
+/客户需求规格说明书.md
+/技术可行性与开发排期及验收守则.md
+
+# Python environments, caches, reports and build outputs
+.venv/
+.venv-*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/
+
+# Runtime data, downloaded OCR models, logs and backups
+data/
+logs/
+backups/
+models/paddleocr/
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

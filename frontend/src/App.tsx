@@ -1,5 +1,6 @@
 import {
   Activity,
+  ArrowLeft,
   ArrowRight,
   Atom,
   BarChart3,
@@ -14,16 +15,20 @@ import {
   FlaskConical,
   FolderKanban,
   Gem,
+  Image,
   Layers3,
+  Languages,
   LoaderCircle,
   LockKeyhole,
   LogOut,
   Menu,
   Network,
   Plus,
+  RotateCcw,
   Search,
   ShieldCheck,
   Sparkles,
+  Table2,
   Upload,
   UserRound,
   X,
@@ -54,6 +59,9 @@ import {
   type GenericRecord,
   type JobItem,
   type Project,
+  type SearchMode,
+  type SearchRun,
+  type SearchScope,
   session,
   type User,
 } from './lib/api'
@@ -724,7 +732,7 @@ const workspaceNav = [
 ]
 
 function WorkspacePage() {
-  const { projectId = '', section = 'overview' } = useParams()
+  const { projectId = '', section = 'overview', documentId } = useParams()
   const [mobileNav, setMobileNav] = useState(false)
   const project = useQuery({
     queryKey: ['project', projectId],
@@ -772,8 +780,18 @@ function WorkspacePage() {
         <button className="mobile-menu" onClick={() => setMobileNav(true)}>
           <Menu size={20} />
         </button>
-        <AppHeader title={workspaceNav.find((item) => item.key === section)?.label || '项目概览'} />
-        <WorkspaceSection projectId={projectId} section={section} project={project.data} />
+        <AppHeader
+          title={
+            documentId
+              ? '文献详情'
+              : workspaceNav.find((item) => item.key === section)?.label || '项目概览'
+          }
+        />
+        {documentId ? (
+          <DocumentDetailSection projectId={projectId} documentId={documentId} />
+        ) : (
+          <WorkspaceSection projectId={projectId} section={section} project={project.data} />
+        )}
       </main>
     </div>
   )
@@ -1089,6 +1107,262 @@ function TaskLogModal({
   )
 }
 
+function formatFileSize(value?: number | null) {
+  if (!value) return '未知大小'
+  if (value < 1024) return `${value} B`
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`
+  return `${(value / 1024 / 1024).toFixed(1)} MB`
+}
+
+function FigurePreview({
+  projectId,
+  documentId,
+  figureId,
+  alt,
+}: {
+  projectId: string
+  documentId: string
+  figureId: string
+  alt: string
+}) {
+  const [source, setSource] = useState<string>()
+  const [failed, setFailed] = useState(false)
+
+  useEffect(() => {
+    let blobUrl = ''
+    let active = true
+    api
+      .figureBlob(projectId, documentId, figureId)
+      .then((blob) => {
+        if (!active) return
+        blobUrl = URL.createObjectURL(blob)
+        setSource(blobUrl)
+      })
+      .catch(() => active && setFailed(true))
+    return () => {
+      active = false
+      if (blobUrl) URL.revokeObjectURL(blobUrl)
+    }
+  }, [documentId, figureId, projectId])
+
+  if (failed) return <div className="figure-placeholder">图片文件不可用</div>
+  if (!source) return <LoadingPane label="正在读取图片" />
+  return <img src={source} alt={alt} />
+}
+
+function DocumentDetailSection({
+  projectId,
+  documentId,
+}: {
+  projectId: string
+  documentId: string
+}) {
+  const queryClient = useQueryClient()
+  const location = useLocation()
+  const [error, setError] = useState<unknown>(null)
+  const [activePage, setActivePage] = useState<number>()
+  const detail = useQuery({
+    queryKey: ['document', projectId, documentId],
+    queryFn: () => api.documentDetail(projectId, documentId),
+  })
+  const reparse = useMutation({
+    mutationFn: () => api.reparseDocument(projectId, documentId),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['document', projectId, documentId] }),
+        queryClient.invalidateQueries({ queryKey: ['jobs', projectId] }),
+      ])
+    },
+    onError: setError,
+  })
+  const translate = useMutation({
+    mutationFn: (versionId: string) => api.translateDocument(projectId, versionId),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['jobs', projectId] }),
+    onError: setError,
+  })
+
+  if (detail.isLoading) return <LoadingPane label="正在读取文献详情" />
+  if (detail.error || !detail.data)
+    return (
+      <div className="workspace-content">
+        <ErrorNotice error={detail.error || new Error('文献详情不存在')} />
+        <Link className="button button-secondary" to={`/app/projects/${projectId}/documents`}>
+          <ArrowLeft size={16} /> 返回文献库
+        </Link>
+      </div>
+    )
+
+  const data = detail.data
+  const requestedPage = Number(new URLSearchParams(location.search).get('page')) || undefined
+  const selectedPage = activePage || requestedPage || data.pages[0]?.page_no
+  const page = data.pages.find((item) => item.page_no === selectedPage)
+  const pageBlocks = data.blocks.filter((block) => block.page_id === page?.id)
+  const pageTables = data.tables.filter((table) => table.page_id === page?.id)
+  const pageFigures = data.figures.filter((figure) => figure.page_id === page?.id)
+  const filename = data.version.original_name || data.document.title || '研究文献'
+
+  return (
+    <div className="workspace-content document-detail">
+      <div className="detail-toolbar">
+        <Link className="back-link" to={`/app/projects/${projectId}/documents`}>
+          <ArrowLeft size={16} /> 返回文献库
+        </Link>
+        <div className="detail-actions">
+          <button
+            className="button button-secondary"
+            onClick={() => api.downloadDocument(projectId, documentId, filename).catch(setError)}
+          >
+            <Download size={16} /> 下载原文
+          </button>
+          <button
+            className="button button-secondary"
+            disabled={translate.isPending}
+            onClick={() => translate.mutate(data.version.id)}
+          >
+            {translate.isPending ? <LoaderCircle className="spin" size={16} /> : <Languages size={16} />}
+            翻译为中文
+          </button>
+          <button
+            className="button button-primary"
+            disabled={reparse.isPending}
+            onClick={() => reparse.mutate()}
+          >
+            {reparse.isPending ? <LoaderCircle className="spin" size={16} /> : <Sparkles size={16} />}
+            重新解析
+          </button>
+        </div>
+      </div>
+      <ErrorNotice error={error || reparse.error || translate.error} />
+      <section className="document-summary glass">
+        <div>
+          <span className="eyebrow">文献证据详情</span>
+          <h2>{data.document.title || filename}</h2>
+          <p>
+            {data.document.authors?.length ? data.document.authors.join('、') : '作者信息待识别'}
+            {data.document.publication_name ? ` · ${data.document.publication_name}` : ''}
+          </p>
+        </div>
+        <StatusPill value={data.version.parse_status} />
+      </section>
+      <div className="metric-grid document-metrics">
+        <MetricCard icon={FileText} label="当前版本" value={`V${data.version.version_no}`} hint={filename} />
+        <MetricCard icon={BookOpen} label="文献页数" value={data.version.page_count ?? data.pages.length} hint="解析页面" />
+        <MetricCard icon={Table2} label="表格数量" value={data.counts.tables} hint={`${data.counts.blocks} 个正文块`} />
+        <MetricCard icon={Image} label="图片数量" value={data.counts.figures} hint={formatFileSize(data.version.byte_size)} />
+      </div>
+      {data.pages.length ? (
+        <div className="evidence-layout">
+          <aside className="page-index glass">
+            <PanelHeading eyebrow="文献目录" title="页面" />
+            <div className="page-index-list">
+              {data.pages.map((item) => (
+                <button
+                  key={item.id}
+                  className={item.page_no === selectedPage ? 'active' : ''}
+                  onClick={() => setActivePage(item.page_no)}
+                >
+                  <span>第 {item.page_no} 页</span>
+                  <small>{item.text_source === 'ocr_paddle' ? 'OCR' : item.text_source}</small>
+                </button>
+              ))}
+            </div>
+          </aside>
+          <section className="evidence-page glass">
+            <div className="evidence-page-head">
+              <div>
+                <span className="eyebrow">原文证据</span>
+                <h3>第 {selectedPage} 页</h3>
+              </div>
+              <div className="page-badges">
+                <span>{page?.text_source === 'ocr_paddle' ? 'OCR 识别' : '内嵌文本'}</span>
+                {page?.ocr_confidence != null && (
+                  <span>置信度 {Math.round(page.ocr_confidence * 100)}%</span>
+                )}
+              </div>
+            </div>
+            <div className="document-blocks">
+              {pageBlocks.length ? (
+                pageBlocks.map((block) => (
+                  <article className={`document-block ${block.block_type}`} key={block.id}>
+                    <small>
+                      {block.block_type} · 块 {block.sequence_no + 1}
+                      {block.confidence != null
+                        ? ` · ${Math.round(block.confidence * 100)}%`
+                        : ''}
+                    </small>
+                    <p>{block.content_text}</p>
+                    {block.bbox?.length === 4 && (
+                      <code>坐标 [{block.bbox.map((value) => Math.round(value)).join(', ')}]</code>
+                    )}
+                  </article>
+                ))
+              ) : page?.text_content ? (
+                <article className="document-block">
+                  <p>{page.text_content}</p>
+                </article>
+              ) : (
+                <EmptyInline text="本页没有可显示的正文" />
+              )}
+            </div>
+            {pageTables.map((table) => {
+              const rows = Array.from({ length: Math.min(table.row_count, 30) }, () =>
+                Array.from({ length: Math.min(table.column_count, 12) }, () => ''),
+              )
+              table.cells.forEach((cell) => {
+                if (rows[cell.row_index]?.[cell.column_index] !== undefined) {
+                  rows[cell.row_index][cell.column_index] =
+                    cell.normalized_text || cell.raw_text || ''
+                }
+              })
+              return (
+                <section className="parsed-table" key={table.id}>
+                  <h4><Table2 size={16} /> {table.title || table.table_no}</h4>
+                  <div className="table-scroll">
+                    <table>
+                      <tbody>
+                        {rows.map((row, rowIndex) => (
+                          <tr key={rowIndex}>
+                            {row.map((cell, columnIndex) => (
+                              <td key={columnIndex}>{cell || '—'}</td>
+                            ))}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </section>
+              )
+            })}
+            {pageFigures.length > 0 && (
+              <div className="figure-grid">
+                {pageFigures.map((figure) => (
+                  <figure key={figure.id}>
+                    {figure.image_file_id ? (
+                      <FigurePreview
+                        projectId={projectId}
+                        documentId={documentId}
+                        figureId={figure.id}
+                        alt={figure.caption || figure.figure_no}
+                      />
+                    ) : (
+                      <div className="figure-placeholder">无图片文件</div>
+                    )}
+                    <figcaption>{figure.caption || figure.title || figure.figure_no}</figcaption>
+                  </figure>
+                ))}
+              </div>
+            )}
+          </section>
+        </div>
+      ) : (
+        <section className="panel glass">
+          <EmptyInline text="文献尚未完成解析，点击“重新解析”创建任务" />
+        </section>
+      )}
+    </div>
+  )
+}
+
 function DocumentsSection({ projectId }: { projectId: string }) {
   const queryClient = useQueryClient()
   const [error, setError] = useState<unknown>(null)
@@ -1146,7 +1420,11 @@ function DocumentsSection({ projectId }: { projectId: string }) {
           ) : documents.data?.items.length ? (
             <div className="record-list">
               {documents.data.items.map((document) => (
-                <div className="record-row document-row" key={document.id}>
+                <Link
+                  className="record-row document-row"
+                  key={document.id}
+                  to={`/app/projects/${projectId}/documents/${document.id}`}
+                >
                   <span className="record-icon">
                     <FileText size={17} />
                   </span>
@@ -1157,7 +1435,8 @@ function DocumentsSection({ projectId }: { projectId: string }) {
                     </small>
                   </div>
                   <StatusPill value={document.parse_status || document.status} />
-                </div>
+                  <ChevronRight size={16} />
+                </Link>
               ))}
             </div>
           ) : (
@@ -1228,26 +1507,87 @@ function SearchSection({ projectId }: { projectId: string }) {
   const queryClient = useQueryClient()
   const [terms, setTerms] = useState('')
   const [name, setName] = useState('')
+  const [mode, setMode] = useState<SearchMode>('hybrid')
+  const [scope, setScope] = useState<SearchScope>('evidence_block')
+  const [logic, setLogic] = useState<'AND' | 'OR'>('AND')
+  const [fuzzyThreshold, setFuzzyThreshold] = useState(82)
+  const [semanticThreshold, setSemanticThreshold] = useState(0.18)
+  const [selectedRunId, setSelectedRunId] = useState('')
+  const [reviewFilter, setReviewFilter] = useState<'all' | 'pending' | 'confirmed' | 'excluded'>('all')
   const searches = useQuery({
     queryKey: ['search-runs', projectId],
     queryFn: () => api.searchRuns(projectId),
+    refetchInterval: 3_000,
+  })
+  const selectedRun = searches.data?.items.find((item) => item.id === selectedRunId)
+  useEffect(() => {
+    if (!selectedRunId && searches.data?.items[0]) {
+      setSelectedRunId(searches.data.items[0].id)
+    }
+  }, [searches.data, selectedRunId])
+  const results = useQuery({
+    queryKey: ['search-results', projectId, selectedRunId],
+    queryFn: () => api.searchResults(projectId, selectedRunId),
+    enabled: Boolean(selectedRunId),
+    refetchInterval: selectedRun && ['queued', 'running'].includes(selectedRun.status) ? 3_000 : false,
   })
   const create = useMutation({
     mutationFn: () =>
-      api.createSearch(
-        projectId,
-        terms
+      api.createSearch(projectId, {
+        terms: terms
           .split(/[,，\n]/)
           .map((item) => item.trim())
           .filter(Boolean),
-        name || undefined,
-      ),
-    onSuccess: () => {
+        name: name || undefined,
+        logic_operator: logic,
+        match_scope: scope,
+        search_mode: mode,
+        fuzzy_threshold: fuzzyThreshold,
+        semantic_threshold: semanticThreshold,
+      }),
+    onSuccess: (accepted) => {
       setTerms('')
       setName('')
-      queryClient.invalidateQueries({ queryKey: ['search-runs', projectId] })
+      setSelectedRunId(accepted.resource_id)
+      void Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['search-runs', projectId] }),
+        queryClient.invalidateQueries({ queryKey: ['jobs', projectId] }),
+      ])
     },
   })
+  const review = useMutation({
+    mutationFn: ({
+      resultId,
+      status,
+    }: {
+      resultId: string
+      status: 'pending' | 'confirmed' | 'excluded'
+    }) =>
+      api.reviewSearchResult(projectId, selectedRunId, resultId, {
+        review_status: status,
+        is_included: status !== 'excluded',
+      }),
+    onSuccess: () =>
+      queryClient.invalidateQueries({
+        queryKey: ['search-results', projectId, selectedRunId],
+      }),
+  })
+  const modeLabels: Record<SearchMode, string> = {
+    exact: '精确检索',
+    fuzzy: '模糊检索',
+    semantic: '语义检索',
+    hybrid: '混合检索',
+  }
+  const scopeLabels: Record<SearchScope, string> = {
+    evidence_block: '正文块',
+    page: '页面',
+    document: '整篇文献',
+  }
+  const visibleResults =
+    results.data?.items.filter(
+      (result) => reviewFilter === 'all' || result.review_status === reviewFilter,
+    ) || []
+
   return (
     <div className="workspace-content">
       <SectionIntro
@@ -1275,6 +1615,54 @@ function SearchSection({ projectId }: { projectId: string }) {
               required
             />
           </label>
+          <label>
+            <span>检索方式</span>
+            <select value={mode} onChange={(event) => setMode(event.target.value as SearchMode)}>
+              {Object.entries(modeLabels).map(([value, label]) => (
+                <option value={value} key={value}>{label}</option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <span>匹配范围</span>
+            <select value={scope} onChange={(event) => setScope(event.target.value as SearchScope)}>
+              {Object.entries(scopeLabels).map(([value, label]) => (
+                <option value={value} key={value}>{label}</option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <span>关键词关系</span>
+            <select value={logic} onChange={(event) => setLogic(event.target.value as 'AND' | 'OR')}>
+              <option value="AND">全部满足（AND）</option>
+              <option value="OR">任一满足（OR）</option>
+            </select>
+          </label>
+          {(mode === 'fuzzy' || mode === 'hybrid') && (
+            <label>
+              <span>模糊阈值：{fuzzyThreshold}</span>
+              <input
+                type="range"
+                min="50"
+                max="100"
+                value={fuzzyThreshold}
+                onChange={(event) => setFuzzyThreshold(Number(event.target.value))}
+              />
+            </label>
+          )}
+          {(mode === 'semantic' || mode === 'hybrid') && (
+            <label>
+              <span>语义阈值：{semanticThreshold.toFixed(2)}</span>
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.01"
+                value={semanticThreshold}
+                onChange={(event) => setSemanticThreshold(Number(event.target.value))}
+              />
+            </label>
+          )}
           <button className="button button-primary" disabled={create.isPending}>
             {create.isPending ? <LoaderCircle className="spin" size={16} /> : <Search size={16} />}
             开始检索
@@ -1282,11 +1670,133 @@ function SearchSection({ projectId }: { projectId: string }) {
         </form>
         <ErrorNotice error={create.error} />
       </div>
-      <RecordsPanel
-        records={searches.data?.items || []}
-        loading={searches.isLoading}
-        empty="尚未执行检索"
-      />
+      <div className="search-workbench">
+        <aside className="search-history glass">
+          <PanelHeading eyebrow="检索历史" title={`${searches.data?.total || 0} 次运行`} />
+          {searches.isLoading ? (
+            <LoadingPane />
+          ) : searches.data?.items.length ? (
+            <div className="search-run-list">
+              {searches.data.items.map((run: SearchRun) => (
+                <button
+                  key={run.id}
+                  className={run.id === selectedRunId ? 'active' : ''}
+                  onClick={() => setSelectedRunId(run.id)}
+                >
+                  <span>
+                    <strong>{run.name || run.terms.join('、') || '未命名检索'}</strong>
+                    <small>{modeLabels[run.search_mode]} · {run.terms.join('、')}</small>
+                  </span>
+                  <span>
+                    <StatusPill value={run.status} />
+                    <b>{run.result_count}</b>
+                  </span>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <EmptyInline text="尚未执行检索" />
+          )}
+        </aside>
+        <section className="search-results glass">
+          <div className="search-results-head">
+            <div>
+              <span className="eyebrow">检索证据</span>
+              <h3>{selectedRun?.name || '选择一次检索运行'}</h3>
+              {selectedRun && (
+                <p>
+                  {modeLabels[selectedRun.search_mode]} · {scopeLabels[selectedRun.match_scope]} ·
+                  {selectedRun.logic_operator === 'AND' ? ' 全部关键词' : ' 任一关键词'}
+                </p>
+              )}
+            </div>
+            <div className="review-filters">
+              {(['all', 'pending', 'confirmed', 'excluded'] as const).map((filter) => (
+                <button
+                  key={filter}
+                  className={reviewFilter === filter ? 'active' : ''}
+                  onClick={() => setReviewFilter(filter)}
+                >
+                  {{ all: '全部', pending: '待审核', confirmed: '已确认', excluded: '已排除' }[filter]}
+                </button>
+              ))}
+            </div>
+          </div>
+          <ErrorNotice error={results.error || review.error} />
+          {results.isLoading ? (
+            <LoadingPane label="正在读取检索结果" />
+          ) : selectedRun && ['queued', 'running'].includes(selectedRun.status) ? (
+            <div className="search-running">
+              <LoaderCircle className="spin" />
+              <strong>正在检索文献证据</strong>
+              <p>结果会在后台任务完成后自动显示。</p>
+            </div>
+          ) : visibleResults.length ? (
+            <div className="evidence-result-list">
+              {visibleResults.map((result) => (
+                <article className={`evidence-result ${result.review_status}`} key={result.id}>
+                  <header>
+                    <div>
+                      <span>结果 #{result.result_no}</span>
+                      <strong>{result.document_title || '未命名文献'} · 第 {result.page_no} 页</strong>
+                    </div>
+                    <span className="evidence-score">{Math.round(Number(result.score || 0))}%</span>
+                  </header>
+                  {result.previous_context && <p className="context-fade">{result.previous_context}</p>}
+                  <blockquote>{result.matched_context}</blockquote>
+                  {result.next_context && <p className="context-fade">{result.next_context}</p>}
+                  <div className="matched-term-list">
+                    {result.matched_terms.map((term, index) => (
+                      <span className={term.matched ? 'matched' : ''} key={`${term.term}-${index}`}>
+                        {term.term} · {Math.round(term.score)}%
+                      </span>
+                    ))}
+                  </div>
+                  <footer>
+                    <Link
+                      className="mini-button"
+                      to={`/app/projects/${projectId}/documents/${result.document_id}?page=${result.page_no}`}
+                    >
+                      查看原文证据 <ChevronRight size={13} />
+                    </Link>
+                    <div>
+                      {result.review_status !== 'confirmed' && (
+                        <button
+                          className="mini-button confirm"
+                          disabled={review.isPending}
+                          onClick={() => review.mutate({ resultId: result.id, status: 'confirmed' })}
+                        >
+                          <CircleCheck size={13} /> 确认
+                        </button>
+                      )}
+                      {result.review_status !== 'excluded' && (
+                        <button
+                          className="mini-button exclude"
+                          disabled={review.isPending}
+                          onClick={() => review.mutate({ resultId: result.id, status: 'excluded' })}
+                        >
+                          <X size={13} /> 排除
+                        </button>
+                      )}
+                      {result.review_status !== 'pending' && (
+                        <button
+                          className="mini-button"
+                          disabled={review.isPending}
+                          onClick={() => review.mutate({ resultId: result.id, status: 'pending' })}
+                        >
+                          <RotateCcw size={13} /> 恢复
+                        </button>
+                      )}
+                    </div>
+                  </footer>
+                </article>
+              ))}
+            </div>
+          ) : (
+            <EmptyInline text={selectedRunId ? '当前筛选下没有检索结果' : '请先创建或选择检索运行'} />
+          )}
+        </section>
+      </div>
     </div>
   )
 }
@@ -1518,6 +2028,14 @@ function App() {
           element={
             <RequireAuth>
               <DashboardPage />
+            </RequireAuth>
+          }
+        />
+        <Route
+          path="/app/projects/:projectId/documents/:documentId"
+          element={
+            <RequireAuth>
+              <WorkspacePage />
             </RequireAuth>
           }
         />

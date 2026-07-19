@@ -52,6 +52,80 @@ export type DocumentItem = {
   created_at: string
 }
 
+export type DocumentDetail = {
+  document: {
+    id: string
+    project_id: string
+    title?: string | null
+    authors: string[]
+    publication_year?: number | null
+    publication_name?: string | null
+    doi?: string | null
+    language?: string | null
+    status: string
+  }
+  version: {
+    id: string
+    version_no: number
+    parse_status: string
+    page_count?: number | null
+    original_name?: string | null
+    byte_size?: number | null
+    media_type?: string | null
+    metadata: Record<string, unknown>
+  }
+  pages: Array<{
+    id: string
+    page_no: number
+    text_content?: string | null
+    text_source: string
+    width?: number | null
+    height?: number | null
+    ocr_confidence?: number | null
+    metadata: Record<string, unknown>
+  }>
+  blocks: Array<{
+    id: string
+    page_id: string
+    block_type: string
+    sequence_no: number
+    content_text: string
+    bbox?: number[] | null
+    confidence?: number | null
+  }>
+  tables: Array<{
+    id: string
+    page_id: string
+    table_no: string
+    title?: string | null
+    row_count: number
+    column_count: number
+    confidence?: number | null
+    cells: Array<{
+      id: string
+      row_index: number
+      column_index: number
+      row_span: number
+      column_span: number
+      raw_text?: string | null
+      normalized_text?: string | null
+    }>
+  }>
+  figures: Array<{
+    id: string
+    page_id: string
+    figure_no: string
+    title?: string | null
+    caption?: string | null
+    figure_type: string
+    image_file_id?: string | null
+    axis_metadata: Record<string, unknown>
+    legend_metadata: Record<string, unknown>
+    extracted_labels: unknown[]
+  }>
+  counts: { blocks: number; tables: number; figures: number }
+}
+
 export type JobItem = {
   id: string
   job_type: string
@@ -84,6 +158,44 @@ export type TaskAccepted = {
 }
 
 export type GenericRecord = Record<string, unknown> & { id: string }
+
+export type SearchMode = 'exact' | 'fuzzy' | 'semantic' | 'hybrid'
+export type SearchScope = 'evidence_block' | 'page' | 'document'
+export type SearchRun = GenericRecord & {
+  name?: string | null
+  logic_operator: 'AND' | 'OR'
+  match_scope: SearchScope
+  search_mode: SearchMode
+  configuration: { fuzzy_threshold?: number; semantic_threshold?: number }
+  status: string
+  terms: string[]
+  result_count: number
+  created_at: string
+}
+export type SearchResult = GenericRecord & {
+  result_no: number
+  document_id: string
+  document_title?: string | null
+  document_version_id: string
+  page_id: string
+  page_no: number
+  evidence_type: string
+  previous_context?: string | null
+  matched_context: string
+  next_context?: string | null
+  matched_terms: Array<{
+    term: string
+    matched: boolean
+    score: number
+    variant?: string | null
+    semantic_score?: number
+  }>
+  match_details: Record<string, unknown>
+  score?: number | null
+  bbox?: number[] | null
+  review_status: 'pending' | 'confirmed' | 'excluded'
+  is_included: boolean
+}
 
 export class ApiError extends Error {
   status: number
@@ -144,6 +256,17 @@ async function request<T>(
 
 const json = (body: unknown) => JSON.stringify(body)
 
+async function authorizedBlob(path: string): Promise<Blob> {
+  const headers = new Headers()
+  const token = session.getToken()
+  if (token) headers.set('Authorization', `Bearer ${token}`)
+  const response = await fetch(`${API_PREFIX}${path}`, { headers })
+  if (!response.ok) {
+    throw new ApiError(response.status, 'download_failed', '文件读取失败')
+  }
+  return response.blob()
+}
+
 export const api = {
   login: (email: string, password: string) =>
     request<TokenResponse>('/auth/login', {
@@ -178,6 +301,29 @@ export const api = {
 
   documents: (projectId: string) =>
     request<ListResponse<DocumentItem>>(`/projects/${projectId}/documents?limit=100`),
+  documentDetail: (projectId: string, documentId: string) =>
+    request<DocumentDetail>(`/projects/${projectId}/documents/${documentId}`),
+  reparseDocument: (projectId: string, documentId: string) =>
+    request<JobItem>(`/projects/${projectId}/documents/${documentId}/parse`, {
+      method: 'POST',
+    }),
+  translateDocument: (projectId: string, versionId: string) =>
+    request<TaskAccepted>(`/projects/${projectId}/document-versions/${versionId}/translate`, {
+      method: 'POST',
+      body: json({ target_language: 'zh-CN', overwrite: false }),
+    }),
+  downloadDocument: async (projectId: string, documentId: string, filename: string) => {
+    const blobUrl = URL.createObjectURL(
+      await authorizedBlob(`/projects/${projectId}/documents/${documentId}/source`),
+    )
+    const anchor = document.createElement('a')
+    anchor.href = blobUrl
+    anchor.download = filename
+    anchor.click()
+    URL.revokeObjectURL(blobUrl)
+  },
+  figureBlob: (projectId: string, documentId: string, figureId: string) =>
+    authorizedBlob(`/projects/${projectId}/documents/${documentId}/figures/${figureId}/image`),
   uploadDocuments: (projectId: string, files: FileList | File[]) => {
     const form = new FormData()
     Array.from(files).forEach((file) => form.append('files', file))
@@ -196,12 +342,37 @@ export const api = {
     request<JobItem>(`/projects/${projectId}/jobs/${jobId}/retry`, { method: 'POST' }),
 
   searchRuns: (projectId: string) =>
-    request<ListResponse<GenericRecord>>(`/projects/${projectId}/search-runs?limit=100`),
-  createSearch: (projectId: string, terms: string[], name?: string) =>
+    request<ListResponse<SearchRun>>(`/projects/${projectId}/search-runs?limit=100`),
+  createSearch: (
+    projectId: string,
+    payload: {
+      terms: string[]
+      name?: string
+      logic_operator: 'AND' | 'OR'
+      match_scope: SearchScope
+      search_mode: SearchMode
+      fuzzy_threshold: number
+      semantic_threshold: number
+    },
+  ) =>
     request<TaskAccepted>(`/projects/${projectId}/search-runs`, {
       method: 'POST',
-      body: json({ name, terms, logic_operator: 'AND', search_mode: 'hybrid' }),
+      body: json(payload),
     }),
+  searchResults: (projectId: string, runId: string) =>
+    request<ListResponse<SearchResult>>(
+      `/projects/${projectId}/search-runs/${runId}/results?limit=500`,
+    ),
+  reviewSearchResult: (
+    projectId: string,
+    runId: string,
+    resultId: string,
+    payload: { is_included: boolean; review_status: 'pending' | 'confirmed' | 'excluded' },
+  ) =>
+    request<SearchResult>(
+      `/projects/${projectId}/search-runs/${runId}/results/${resultId}`,
+      { method: 'PATCH', body: json(payload) },
+    ),
   terms: (projectId: string) =>
     request<ListResponse<GenericRecord>>(`/projects/${projectId}/terms?limit=200`),
   fieldSchemas: (projectId: string) =>

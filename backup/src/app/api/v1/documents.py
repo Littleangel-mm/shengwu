@@ -55,6 +55,19 @@ def download_source(project_id: UUID, document_id: UUID, db: DbSession):
     return FileResponse(path, filename=filename, media_type=media_type)
 
 
+@router.get("/{project_id}/documents/{document_id}/figures/{figure_id}/image")
+def download_figure(
+    project_id: UUID,
+    document_id: UUID,
+    figure_id: UUID,
+    db: DbSession,
+):
+    path, filename, media_type = DocumentService(
+        db, LocalStorage(get_settings())
+    ).figure_path(project_id, document_id, figure_id)
+    return FileResponse(path, filename=filename, media_type=media_type)
+
+
 @router.post(
     "/{project_id}/documents/{document_id}/parse", response_model=JobResponse, status_code=202
 )

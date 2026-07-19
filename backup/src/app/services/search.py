@@ -82,6 +82,8 @@ class SearchService:
 
     def list_runs(self, project_id: UUID, offset: int, limit: int) -> tuple[list[dict], int]:
         runs = table(self.db, "search_runs")
+        terms = table(self.db, "search_terms")
+        results = table(self.db, "search_results")
         total = (
             self.db.scalar(
                 select(func.count()).select_from(runs).where(runs.c.project_id == project_id)
@@ -99,13 +101,35 @@ class SearchService:
             .mappings()
             .all()
         )
-        return [dict(row) for row in rows], total
+        items = [dict(row) for row in rows]
+        run_ids = [item["id"] for item in items]
+        if run_ids:
+            term_rows = self.db.execute(
+                select(terms.c.search_run_id, terms.c.term_text)
+                .where(terms.c.search_run_id.in_(run_ids))
+                .order_by(terms.c.search_run_id, terms.c.position)
+            ).all()
+            result_counts: dict[UUID, int] = {}
+            for search_run_id, result_count in self.db.execute(
+                select(results.c.search_run_id, func.count())
+                .where(results.c.search_run_id.in_(run_ids))
+                .group_by(results.c.search_run_id)
+            ):
+                result_counts[search_run_id] = int(result_count)
+            terms_by_run: dict[UUID, list[str]] = {}
+            for search_run_id, term_text in term_rows:
+                terms_by_run.setdefault(search_run_id, []).append(term_text)
+            for item in items:
+                item["terms"] = terms_by_run.get(item["id"], [])
+                item["result_count"] = result_counts.get(item["id"], 0)
+        return items, total
 
     def list_results(
         self, project_id: UUID, run_id: UUID, offset: int, limit: int
     ) -> tuple[list[dict], int]:
         runs = table(self.db, "search_runs")
         results = table(self.db, "search_results")
+        pages = table(self.db, "document_pages")
         if not self.db.scalar(
             select(runs.c.id).where(runs.c.id == run_id, runs.c.project_id == project_id)
         ):
@@ -118,7 +142,18 @@ class SearchService:
         )
         rows = (
             self.db.execute(
-                select(results)
+                select(
+                    results,
+                    pages.c.page_no,
+                    Document.id.label("document_id"),
+                    Document.title.label("document_title"),
+                )
+                .join(pages, pages.c.id == results.c.page_id)
+                .join(
+                    DocumentVersion,
+                    DocumentVersion.id == results.c.document_version_id,
+                )
+                .join(Document, Document.id == DocumentVersion.document_id)
                 .where(results.c.search_run_id == run_id)
                 .order_by(results.c.result_no)
                 .offset(offset)
@@ -255,90 +290,136 @@ class SearchService:
             .mappings()
             .all()
         )
-        block_texts = [str(row["content_text"] or "") for row in rows]
-        semantic_matrix = self._semantic_scores(
-            block_texts, [str(row["term_text"]) for row in term_rows]
-        )
-        semantic_by_block = {
-            row["block_id"]: semantic_matrix[index] for index, row in enumerate(rows)
-        }
         by_document: dict[UUID, list[dict]] = {}
         for row in rows:
             by_document.setdefault(row["document_version_id"], []).append(dict(row))
 
+        scope = run["match_scope"]
+        units: list[dict[str, Any]] = []
+        for document_rows in by_document.values():
+            if scope == "evidence_block":
+                units.extend(
+                    {
+                        "text": str(row["content_text"] or ""),
+                        "source_rows": [row],
+                        "document_rows": document_rows,
+                    }
+                    for row in document_rows
+                )
+            elif scope == "page":
+                page_groups: dict[UUID, list[dict]] = {}
+                for source_row in document_rows:
+                    page_groups.setdefault(source_row["page_id"], []).append(source_row)
+                units.extend(
+                    {
+                        "text": "\n".join(str(row["content_text"] or "") for row in page_rows),
+                        "source_rows": page_rows,
+                        "document_rows": document_rows,
+                    }
+                    for page_rows in page_groups.values()
+                )
+            else:
+                units.append(
+                    {
+                        "text": "\n".join(
+                            str(row["content_text"] or "") for row in document_rows
+                        ),
+                        "source_rows": document_rows,
+                        "document_rows": document_rows,
+                    }
+                )
+
+        unit_texts = [unit["text"] for unit in units]
+        semantic_matrix = self._semantic_scores(
+            unit_texts, [str(row["term_text"]) for row in term_rows]
+        )
         result_no = 0
         inserts = []
         threshold = int((run["configuration"] or {}).get("fuzzy_threshold", 82))
-        total_blocks = max(len(rows), 1)
-        processed = 0
-        for document_rows in by_document.values():
-            for index, block_row in enumerate(document_rows):
-                text_value = block_row["content_text"] or ""
-                matches = []
-                block_semantic = semantic_by_block.get(block_row["block_id"], [])
-                for term_index, term_row in enumerate(term_rows):
-                    semantic_score = (
-                        float(block_semantic[term_index])
-                        if term_index < len(block_semantic)
-                        else 0.0
-                    )
-                    matched, score, variant = self._term_match(
-                        text_value,
-                        term_row,
-                        run["search_mode"],
-                        threshold,
-                        semantic_score,
-                        float((run["configuration"] or {}).get("semantic_threshold", 0.18)),
-                    )
-                    matches.append(
-                        {
-                            "term": term_row["term_text"],
-                            "matched": matched,
-                            "score": score,
-                            "variant": variant,
-                            "semantic_score": semantic_score,
-                        }
-                    )
-                accepted = (
-                    all(item["matched"] for item in matches)
-                    if run["logic_operator"] == "AND"
-                    else any(item["matched"] for item in matches)
+        semantic_threshold = float(
+            (run["configuration"] or {}).get("semantic_threshold", 0.18)
+        )
+        total_units = max(len(units), 1)
+        for unit_index, unit in enumerate(units):
+            text_value = unit["text"]
+            matches = []
+            unit_semantic = semantic_matrix[unit_index] if unit_index < len(semantic_matrix) else []
+            for term_index, term_row in enumerate(term_rows):
+                semantic_score = (
+                    float(unit_semantic[term_index]) if term_index < len(unit_semantic) else 0.0
                 )
-                if accepted:
-                    result_no += 1
-                    inserts.append(
-                        {
-                            "search_run_id": run_id,
-                            "result_no": result_no,
-                            "document_version_id": block_row["document_version_id"],
-                            "page_id": block_row["page_id"],
-                            "block_id": block_row["block_id"],
-                            "evidence_type": "text",
-                            "previous_context": document_rows[index - 1]["content_text"]
-                            if index > 0
-                            else None,
-                            "matched_context": text_value,
-                            "next_context": document_rows[index + 1]["content_text"]
-                            if index + 1 < len(document_rows)
-                            else None,
-                            "matched_terms": matches,
-                            "match_details": {
-                                "mode": run["search_mode"],
-                                "fuzzy_threshold": threshold,
-                                "semantic_threshold": (run["configuration"] or {}).get(
-                                    "semantic_threshold", 0.18
-                                ),
-                                "semantic_engine": "local_lsa_v1",
-                            },
-                            "score": sum(item["score"] for item in matches) / max(len(matches), 1),
-                            "bbox": block_row["bbox"],
-                            "review_status": "pending",
-                            "is_included": True,
-                        }
-                    )
-                processed += 1
-                if processed % 200 == 0:
-                    progress(5 + 90 * processed / total_blocks, "searching_blocks")
+                matched, score, variant = self._term_match(
+                    text_value,
+                    term_row,
+                    run["search_mode"],
+                    threshold,
+                    semantic_score,
+                    semantic_threshold,
+                )
+                matches.append(
+                    {
+                        "term": term_row["term_text"],
+                        "matched": matched,
+                        "score": score,
+                        "variant": variant,
+                        "semantic_score": semantic_score,
+                    }
+                )
+            accepted = (
+                all(item["matched"] for item in matches)
+                if run["logic_operator"] == "AND"
+                else any(item["matched"] for item in matches)
+            )
+            if accepted:
+                source_rows = unit["source_rows"]
+                block_row = max(
+                    source_rows,
+                    key=lambda row: max(
+                        (
+                            partial_ratio(
+                                str(term["term_text"]).casefold(),
+                                str(row["content_text"] or "").casefold(),
+                            )
+                            for term in term_rows
+                        ),
+                        default=0,
+                    ),
+                )
+                document_rows = unit["document_rows"]
+                source_index = document_rows.index(block_row)
+                result_no += 1
+                inserts.append(
+                    {
+                        "search_run_id": run_id,
+                        "result_no": result_no,
+                        "document_version_id": block_row["document_version_id"],
+                        "page_id": block_row["page_id"],
+                        "block_id": block_row["block_id"],
+                        "evidence_type": "text",
+                        "previous_context": document_rows[source_index - 1]["content_text"]
+                        if source_index > 0
+                        else None,
+                        "matched_context": block_row["content_text"],
+                        "next_context": document_rows[source_index + 1]["content_text"]
+                        if source_index + 1 < len(document_rows)
+                        else None,
+                        "matched_terms": matches,
+                        "match_details": {
+                            "mode": run["search_mode"],
+                            "scope": scope,
+                            "fuzzy_threshold": threshold,
+                            "semantic_threshold": semantic_threshold,
+                            "semantic_engine": "local_lsa_v1",
+                        },
+                        "score": sum(item["score"] for item in matches)
+                        / max(len(matches), 1),
+                        "bbox": block_row["bbox"],
+                        "review_status": "pending",
+                        "is_included": True,
+                    }
+                )
+            if unit_index % 200 == 0:
+                progress(5 + 90 * (unit_index + 1) / total_units, "searching_blocks")
         if inserts:
             self.db.execute(insert(results), inserts)
         self.db.execute(

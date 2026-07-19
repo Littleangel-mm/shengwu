@@ -304,9 +304,11 @@ class DocumentService:
             raise AppError(
                 code="document_version_not_found", message="文献版本不存在", status_code=404
             )
+        source_file = self.db.get(StoredFile, version.source_file_id)
         pages = table(self.db, "document_pages")
         blocks = table(self.db, "document_blocks")
         tables_table = table(self.db, "document_tables")
+        cells = table(self.db, "document_table_cells")
         figures = table(self.db, "document_figures")
         page_rows = [
             dict(row)
@@ -314,6 +316,52 @@ class DocumentService:
                 select(pages)
                 .where(pages.c.document_version_id == version.id)
                 .order_by(pages.c.page_no)
+            ).mappings()
+        ]
+        block_rows = [
+            dict(row)
+            for row in self.db.execute(
+                select(blocks)
+                .where(blocks.c.document_version_id == version.id)
+                .order_by(blocks.c.page_id, blocks.c.sequence_no)
+            ).mappings()
+        ]
+        table_rows = [
+            dict(row)
+            for row in self.db.execute(
+                select(tables_table)
+                .where(tables_table.c.document_version_id == version.id)
+                .order_by(tables_table.c.page_id, tables_table.c.table_no)
+            ).mappings()
+        ]
+        table_ids = [row["id"] for row in table_rows]
+        cell_rows = (
+            [
+                dict(row)
+                for row in self.db.execute(
+                    select(cells)
+                    .where(cells.c.table_id.in_(table_ids))
+                    .order_by(
+                        cells.c.table_id,
+                        cells.c.row_index,
+                        cells.c.column_index,
+                    )
+                ).mappings()
+            ]
+            if table_ids
+            else []
+        )
+        cells_by_table: dict[UUID, list[dict]] = {}
+        for cell in cell_rows:
+            cells_by_table.setdefault(cell["table_id"], []).append(cell)
+        for table_row in table_rows:
+            table_row["cells"] = cells_by_table.get(table_row["id"], [])
+        figure_rows = [
+            dict(row)
+            for row in self.db.execute(
+                select(figures)
+                .where(figures.c.document_version_id == version.id)
+                .order_by(figures.c.page_id, figures.c.figure_no)
             ).mappings()
         ]
         return {
@@ -333,9 +381,15 @@ class DocumentService:
                 "version_no": version.version_no,
                 "parse_status": version.parse_status,
                 "page_count": version.page_count,
+                "original_name": source_file.original_name if source_file else None,
+                "byte_size": source_file.byte_size if source_file else None,
+                "media_type": source_file.media_type if source_file else None,
                 "metadata": version.metadata_json,
             },
             "pages": page_rows,
+            "blocks": block_rows,
+            "tables": table_rows,
+            "figures": figure_rows,
             "counts": {
                 "blocks": self.db.scalar(
                     select(func.count())
@@ -373,6 +427,32 @@ class DocumentService:
         return (
             self.storage.path_for_key(stored.storage_key),
             stored.original_name,
+            stored.media_type,
+        )
+
+    def figure_path(
+        self, project_id: UUID, document_id: UUID, figure_id: UUID
+    ) -> tuple[Path, str, str | None]:
+        figures = table(self.db, "document_figures")
+        row = self.db.execute(
+            select(figures.c.figure_no, StoredFile)
+            .join(DocumentVersion, DocumentVersion.id == figures.c.document_version_id)
+            .join(Document, Document.id == DocumentVersion.document_id)
+            .join(StoredFile, StoredFile.id == figures.c.image_file_id)
+            .where(
+                figures.c.id == figure_id,
+                Document.id == document_id,
+                Document.project_id == project_id,
+                Document.deleted_at.is_(None),
+                StoredFile.deleted_at.is_(None),
+            )
+        ).one_or_none()
+        if not row:
+            raise AppError(code="figure_not_found", message="文献图片不存在", status_code=404)
+        figure_no, stored = row
+        return (
+            self.storage.path_for_key(stored.storage_key),
+            f"{figure_no}.{stored.extension or 'png'}",
             stored.media_type,
         )
 

@@ -3,13 +3,14 @@ from collections.abc import Callable
 from decimal import Decimal
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import insert, select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.errors import AppError
 from app.core.logging import configure_logging, get_logger
 from app.db.session import SessionLocal
+from app.db.tables import table
 from app.models import ProcessingJob
 from app.services.parser import DocumentParser
 from app.services.storage import LocalStorage
@@ -26,9 +27,42 @@ class JobWorker:
         def update_progress(percent: float, stage: str) -> None:
             job.progress_percent = Decimal(str(max(0, min(100, percent))))
             job.current_stage = stage
+            self._record_event(
+                db,
+                job.id,
+                event_type="progress",
+                stage=stage,
+                progress_percent=job.progress_percent,
+                message=f"任务进入阶段：{stage}",
+            )
             db.commit()
 
         return update_progress
+
+    @staticmethod
+    def _record_event(
+        db: Session,
+        job_id: UUID,
+        *,
+        event_type: str,
+        stage: str | None,
+        progress_percent: Decimal | None,
+        message: str,
+        level: str = "info",
+        payload: dict | None = None,
+    ) -> None:
+        events = table(db, "job_events")
+        db.execute(
+            insert(events).values(
+                job_id=job_id,
+                event_type=event_type,
+                stage=stage,
+                progress_percent=progress_percent,
+                level=level,
+                message=message,
+                payload=payload or {},
+            )
+        )
 
     def claim_next(self, db: Session) -> UUID | None:
         job = db.scalar(
@@ -46,6 +80,14 @@ class JobWorker:
         from datetime import UTC, datetime
 
         job.started_at = datetime.now(UTC)
+        self._record_event(
+            db,
+            job.id,
+            event_type="started",
+            stage="starting",
+            progress_percent=job.progress_percent,
+            message="后台工作进程已领取任务",
+        )
         db.commit()
         return job.id
 
@@ -69,6 +111,15 @@ class JobWorker:
                 job.completed_at = datetime.now(UTC)
                 job.error_code = None
                 job.error_message = None
+                self._record_event(
+                    db,
+                    job.id,
+                    event_type="completed",
+                    stage="completed",
+                    progress_percent=Decimal("100"),
+                    message="任务处理完成",
+                    payload=result or {},
+                )
                 db.commit()
                 return True
             except AppError as exc:
@@ -79,6 +130,16 @@ class JobWorker:
                     job.error_code = exc.code
                     job.error_message = exc.message
                     job.current_stage = "failed"
+                    self._record_event(
+                        db,
+                        job.id,
+                        event_type="failed",
+                        stage="failed",
+                        progress_percent=job.progress_percent,
+                        level="error",
+                        message=exc.message,
+                        payload={"error_code": exc.code},
+                    )
                     db.commit()
                 logger.warning("job_failed", extra={"job_id": str(job_id), "error_code": exc.code})
                 return False
@@ -90,6 +151,16 @@ class JobWorker:
                     job.error_code = "worker_error"
                     job.error_message = str(exc)[:4000]
                     job.current_stage = "failed"
+                    self._record_event(
+                        db,
+                        job.id,
+                        event_type="failed",
+                        stage="failed",
+                        progress_percent=job.progress_percent,
+                        level="error",
+                        message=job.error_message,
+                        payload={"error_code": "worker_error"},
+                    )
                     db.commit()
                 logger.exception("job_crashed", extra={"job_id": str(job_id)})
                 return False

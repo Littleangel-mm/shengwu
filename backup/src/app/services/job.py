@@ -1,3 +1,4 @@
+import builtins
 from decimal import Decimal
 from uuid import UUID
 
@@ -5,8 +6,9 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.errors import AppError
+from app.db.tables import table
 from app.models import ProcessingJob, Project
-from app.schemas.job import JobResponse
+from app.schemas.job import JobEventResponse, JobResponse
 
 
 class JobService:
@@ -44,6 +46,16 @@ class JobService:
         if not job:
             raise AppError(code="job_not_found", message="任务不存在", status_code=404)
         return JobResponse.model_validate(job)
+
+    def events(self, project_id: UUID, job_id: UUID) -> builtins.list[JobEventResponse]:
+        self.get(project_id, job_id)
+        events = table(self.db, "job_events")
+        rows = (
+            self.db.execute(select(events).where(events.c.job_id == job_id).order_by(events.c.id))
+            .mappings()
+            .all()
+        )
+        return [JobEventResponse.model_validate(row) for row in rows]
 
     def retry(self, project_id: UUID, job_id: UUID) -> JobResponse:
         self._ensure_project(project_id)

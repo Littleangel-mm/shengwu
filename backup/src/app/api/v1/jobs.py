@@ -5,7 +5,7 @@ from fastapi import APIRouter, Query
 from app.api.deps import DbSession
 from app.core.errors import AppError
 from app.schemas.common import ListResponse
-from app.schemas.job import JobResponse
+from app.schemas.job import JobEventResponse, JobResponse
 from app.services.job import JobService
 
 router = APIRouter()
@@ -25,6 +25,11 @@ def list_jobs(
 @router.get("/{project_id}/jobs/{job_id}", response_model=JobResponse)
 def get_job(project_id: UUID, job_id: UUID, db: DbSession) -> JobResponse:
     return JobService(db).get(project_id, job_id)
+
+
+@router.get("/{project_id}/jobs/{job_id}/events", response_model=list[JobEventResponse])
+def list_job_events(project_id: UUID, job_id: UUID, db: DbSession) -> list[JobEventResponse]:
+    return JobService(db).events(project_id, job_id)
 
 
 @router.post("/{project_id}/jobs/{job_id}/retry", response_model=JobResponse)

@@ -24,3 +24,15 @@ class JobResponse(BaseModel):
     started_at: datetime | None
     completed_at: datetime | None
     updated_at: datetime
+
+
+class JobEventResponse(BaseModel):
+    id: int
+    job_id: UUID
+    event_type: str
+    stage: str | None
+    progress_percent: Decimal | None
+    level: str
+    message: str | None
+    payload: dict[str, Any]
+    created_at: datetime

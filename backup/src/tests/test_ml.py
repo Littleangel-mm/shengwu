@@ -21,6 +21,27 @@ def test_ml_configuration_rejects_task_incompatible_algorithm() -> None:
         )
 
 
+def test_ml_configuration_uses_safe_grouped_split_by_default() -> None:
+    payload = MLRunCreate(
+        name="grouped",
+        dataset_version_id="00000000-0000-0000-0000-000000000001",
+        input_field_ids=["00000000-0000-0000-0000-000000000002"],
+        target_field_id="00000000-0000-0000-0000-000000000003",
+    )
+    assert payload.split_strategy == "group_shuffle_split"
+
+
+def test_ml_configuration_allows_explicit_random_split() -> None:
+    payload = MLRunCreate(
+        name="random",
+        dataset_version_id="00000000-0000-0000-0000-000000000001",
+        input_field_ids=["00000000-0000-0000-0000-000000000002"],
+        target_field_id="00000000-0000-0000-0000-000000000003",
+        split_strategy="random_split",
+    )
+    assert payload.split_strategy == "random_split"
+
+
 def test_preprocessor_handles_numeric_and_categorical_features() -> None:
     frame = pd.DataFrame(
         {

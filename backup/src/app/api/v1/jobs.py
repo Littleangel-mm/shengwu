@@ -40,7 +40,9 @@ def retry_job(project_id: UUID, job_id: UUID, db: DbSession) -> JobResponse:
 @router.post("/{project_id}/jobs/{job_id}/run", response_model=JobResponse)
 def run_job_now(project_id: UUID, job_id: UUID, db: DbSession) -> JobResponse:
     job = JobService(db).get(project_id, job_id)
-    if job.status not in {"queued", "failed"}:
+    if job.status == "failed":
+        job = JobService(db).retry(project_id, job_id)
+    if job.status != "queued":
         raise AppError(code="job_not_runnable", message="任务当前状态不可执行", status_code=409)
     from app.worker import JobWorker
 

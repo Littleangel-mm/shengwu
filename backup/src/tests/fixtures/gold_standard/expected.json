@@ -1,0 +1,48 @@
+{
+  "documents": [
+    {"id": "doc-ok"},
+    {"id": "doc-partial"}
+  ],
+  "fields": [
+    {"id": "field-ok", "value": "叶面积"},
+    {"id": "field-wrong", "value": "12 h"}
+  ],
+  "numbers": [
+    {"id": "number-ok", "value": 10.0, "unit": "mg/L", "tolerance": 0.2},
+    {"id": "number-wrong", "value": 20.0, "unit": "°C", "tolerance": 0.1}
+  ],
+  "associations": [
+    {
+      "id": "association-ok",
+      "treatment_group": "A",
+      "timepoint": "24 h",
+      "condition": "dark"
+    },
+    {
+      "id": "association-wrong",
+      "treatment_group": "B",
+      "timepoint": "48 h",
+      "condition": "light"
+    }
+  ],
+  "tables": [
+    {
+      "id": "table-ok",
+      "headers": [["group", "value"]],
+      "merged_cells": [],
+      "footnotes": ["mean"],
+      "cells": [["A", "1.0"]]
+    },
+    {
+      "id": "table-wrong",
+      "headers": [["group", "value"]],
+      "merged_cells": ["A1:A2"],
+      "footnotes": [],
+      "cells": [["B", "2.0"]]
+    }
+  ],
+  "translations": [
+    {"id": "translation-ok", "reference": "leaf area increased", "min_score": 1.0},
+    {"id": "translation-wrong", "reference": "root length decreased", "min_score": 0.9}
+  ]
+}

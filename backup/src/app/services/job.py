@@ -1,4 +1,5 @@
 import builtins
+from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import UUID
 
@@ -60,9 +61,9 @@ class JobService:
     def retry(self, project_id: UUID, job_id: UUID) -> JobResponse:
         self._ensure_project(project_id)
         job = self.db.scalar(
-            select(ProcessingJob).where(
-                ProcessingJob.id == job_id, ProcessingJob.project_id == project_id
-            )
+            select(ProcessingJob)
+            .where(ProcessingJob.id == job_id, ProcessingJob.project_id == project_id)
+            .with_for_update()
         )
         if not job:
             raise AppError(code="job_not_found", message="任务不存在", status_code=404)
@@ -70,14 +71,23 @@ class JobService:
             raise AppError(
                 code="job_not_retryable", message="只有失败或取消的任务可以重试", status_code=409
             )
+        if job.retry_count >= job.max_retries:
+            raise AppError(
+                code="job_retry_limit_exceeded",
+                message="任务已达到最大重试次数",
+                status_code=409,
+            )
         job.status = "queued"
         job.progress_percent = Decimal("0")
         job.current_stage = "waiting"
         job.error_code = None
         job.error_message = None
         job.retry_count += 1
+        job.worker_name = None
+        job.heartbeat_at = None
         job.started_at = None
         job.completed_at = None
+        job.queued_at = datetime.now(UTC)
         self.db.commit()
         self.db.refresh(job)
         return JobResponse.model_validate(job)

@@ -1,8 +1,8 @@
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 
 class OrganizationCreate(BaseModel):
@@ -21,3 +21,25 @@ class OrganizationResponse(BaseModel):
     settings: dict[str, Any]
     created_at: datetime
     updated_at: datetime
+
+
+OrganizationRole = Literal["owner", "admin", "member"]
+
+
+class OrganizationMemberInvite(BaseModel):
+    email: EmailStr
+    role: OrganizationRole = "member"
+
+
+class OrganizationMemberUpdate(BaseModel):
+    role: OrganizationRole
+
+
+class OrganizationMemberResponse(BaseModel):
+    id: UUID
+    user_id: UUID
+    email: str
+    display_name: str
+    role: OrganizationRole
+    status: str
+    joined_at: datetime

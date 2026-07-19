@@ -39,3 +39,21 @@ npm run dev
 ```
 
 访问 `http://127.0.0.1:5173`。开发服务器会将 `/api` 请求代理到本地 8000 端口。
+
+## 验收与交付
+
+后端提供金标准 manifest SHA-256 校验、合成/客户 `expected.json` 与 `actual.json` 导入、
+六类指标评估以及 JSON/Markdown 问题清单工具。具体命令见
+[`backup/src/README.md`](backup/src/README.md)。
+
+交付文档：
+
+- [客户金标准规范](backup/src/docs/GOLD_STANDARD_SPEC.md)
+- [UAT 验收报告](backup/src/docs/UAT_ACCEPTANCE_REPORT.md)
+- [用户使用指南](backup/src/docs/USER_GUIDE.md)
+- [运维指南](backup/src/docs/OPERATIONS_GUIDE.md)
+- [生产上线检查清单](backup/src/docs/PRODUCTION_CHECKLIST.md)
+- [最终交付检查清单](backup/src/docs/DELIVERY_CHECKLIST.md)
+
+仓库内合成 fixture 只用于验证评分工具，不代表客户真实准确率。客户金标准版本、阈值、
+容差、真实 UAT、生产演练及客户签字均为明确待办，完成前不得声称客户验收通过。

@@ -464,6 +464,9 @@ def test_complete_backend_workflow() -> None:
             f"/api/v1/projects/{project_id}/ml-runs/{ml_run['resource_id']}", headers=headers
         )
     )
+    assert ml_detail["job_id"] == ml_run["job_id"]
+    assert ml_detail["status"] == "completed"
+    assert ml_detail["split_strategy"] == "group_shuffle_split"
     assert len(ml_detail["models"]) == 2
     model_ids = [model["id"] for model in ml_detail["models"]]
     checked(
@@ -515,6 +518,11 @@ def test_complete_backend_workflow() -> None:
         )
     )
     assert optimized["candidates"][0]["uncertainty"]
+    optimization_list = checked(
+        client.get(f"/api/v1/projects/{project_id}/optimization-runs", headers=headers)
+    )
+    assert optimization_list[0]["id"] == optimization["resource_id"]
+    assert optimization_list[0]["job_id"] == optimization["job_id"]
 
     report = checked(
         client.post(
@@ -540,9 +548,26 @@ def test_complete_backend_workflow() -> None:
         },
     )
     assert cross_project_report.status_code == 404
+    queued_report = checked(
+        client.get(
+            f"/api/v1/projects/{project_id}/reports/{report['resource_id']}",
+            headers=headers,
+        )
+    )
+    assert queued_report["job_id"] == report["job_id"]
+    assert queued_report["download_ready"] is False
     checked(
         client.post(f"/api/v1/projects/{project_id}/jobs/{report['job_id']}/run", headers=headers)
     )
+    report_detail = checked(
+        client.get(
+            f"/api/v1/projects/{project_id}/reports/{report['resource_id']}",
+            headers=headers,
+        )
+    )
+    assert report_detail["status"] == "completed"
+    assert report_detail["download_ready"] is True
+    assert isinstance(report_detail["assets"], list)
     downloaded = client.get(
         f"/api/v1/projects/{project_id}/reports/{report['resource_id']}/download",
         headers=headers,

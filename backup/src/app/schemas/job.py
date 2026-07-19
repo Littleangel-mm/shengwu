@@ -20,8 +20,11 @@ class JobResponse(BaseModel):
     error_code: str | None
     error_message: str | None
     retry_count: int
+    max_retries: int
+    worker_name: str | None
     queued_at: datetime
     started_at: datetime | None
+    heartbeat_at: datetime | None
     completed_at: datetime | None
     updated_at: datetime
 

@@ -1,0 +1,16 @@
+{
+  "schema_version": "1.0",
+  "files": [
+    {
+      "path": "actual.json",
+      "size": 1186,
+      "sha256": "4b6f1e77d5bbf237d51db05059d69ae3f7654b627e96eab4486badaf3ee55d9c"
+    },
+    {
+      "path": "expected.json",
+      "size": 1171,
+      "sha256": "33cc789832e3d31b69841d492955fe033b69b150b5dfcd070b6263c8994dbf2c"
+    }
+  ],
+  "manifest_sha256": "43794d91a7074b2df03fc069d2271e65a373206db8a6e9da84ec20c11529d70f"
+}

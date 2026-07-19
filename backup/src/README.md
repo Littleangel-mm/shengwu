@@ -138,8 +138,33 @@ gold-standard document set with expected extraction values, tolerances and scori
 also requires customer execution and sign-off; neither result should be claimed from synthetic test
 fixtures alone.
 
-Delivery templates are available in `docs/GOLD_STANDARD_SPEC.md` and
-`docs/UAT_ACCEPTANCE_REPORT.md`.
+Gold-standard development precheck:
+
+```powershell
+python -m scripts.gold_standard_manifest create path\gold expected.json actual.json --output path\gold\manifest.json
+python -m scripts.gold_standard_manifest verify path\gold\manifest.json
+python -m scripts.gold_standard_import --manifest path\gold\manifest.json --expected path\gold\expected.json --actual path\gold\actual.json --output path\gold\bundle.json
+python -m scripts.gold_standard_evaluate --expected path\gold\expected.json --actual path\gold\actual.json --json-output path\gold\report.json --markdown-output path\gold\issues.md
+```
+
+The manifest records its own canonical SHA-256 plus each input file's size and SHA-256. The
+`expected.json` and `actual.json` files use arrays named `documents`, `fields`, `numbers`,
+`associations`, `tables` and `translations`; every record has a unique string `id`. Numeric
+expectations may define absolute `tolerance` and `relative_tolerance`. Translation scoring is
+repeatable reference-text similarity for development precheck, not a replacement for customer
+bilingual blind review.
+
+Delivery and acceptance documents:
+
+- `docs/GOLD_STANDARD_SPEC.md`
+- `docs/UAT_ACCEPTANCE_REPORT.md`
+- `docs/USER_GUIDE.md`
+- `docs/OPERATIONS_GUIDE.md`
+- `docs/PRODUCTION_CHECKLIST.md`
+- `docs/DELIVERY_CHECKLIST.md`
+
+Customer gold-standard confirmation, real UAT, production rehearsal and customer sign-off remain
+explicit pending actions.
 
 ## External services and extraction limits
 

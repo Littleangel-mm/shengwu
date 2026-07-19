@@ -1,0 +1,64 @@
+name: Quality
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: research_app
+          POSTGRES_PASSWORD: research_test
+          POSTGRES_DB: research_platform
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U research_app -d research_platform"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    defaults:
+      run:
+        working-directory: backup/src
+    env:
+      APP_ENV: test
+      APP_SECRET: ci-only-secret-with-at-least-thirty-two-characters
+      DB_HOST: 127.0.0.1
+      DB_PORT: 5432
+      DB_USER: research_app
+      DB_PASSWORD: research_test
+      DB_NAME: research_platform
+      ALLOW_ACTOR_HEADER: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backup/src/pyproject.toml
+      - run: pip install -e ".[dev]"
+      - run: alembic upgrade head
+      - run: ruff check app tests
+      - run: mypy app
+      - run: pytest -q
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build

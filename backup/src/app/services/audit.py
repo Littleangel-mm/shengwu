@@ -14,20 +14,22 @@ class AuditService:
     def record(
         self,
         *,
-        project_id: UUID,
         actor_id: UUID | None,
         entity_type: str,
         entity_id: UUID | None,
         action: str,
+        organization_id: UUID | None = None,
+        project_id: UUID | None = None,
         before: Any = None,
         after: Any = None,
         reason: str | None = None,
     ) -> None:
-        projects = table(self.db, "projects")
         logs = table(self.db, "audit_logs")
-        organization_id = self.db.scalar(
-            select(projects.c.organization_id).where(projects.c.id == project_id)
-        )
+        if organization_id is None and project_id is not None:
+            projects = table(self.db, "projects")
+            organization_id = self.db.scalar(
+                select(projects.c.organization_id).where(projects.c.id == project_id)
+            )
         if not organization_id:
             return
         self.db.execute(

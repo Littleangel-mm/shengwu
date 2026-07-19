@@ -28,6 +28,11 @@ def list_reports(project_id: UUID, db: DbSession):
     return service(db).list(project_id)
 
 
+@router.get("/{project_id}/reports/{report_id}", response_model=dict[str, Any])
+def get_report(project_id: UUID, report_id: UUID, db: DbSession):
+    return service(db).get(project_id, report_id)
+
+
 @router.get("/{project_id}/reports/{report_id}/download")
 def download_report(project_id: UUID, report_id: UUID, db: DbSession):
     path, filename = service(db).output_path(project_id, report_id)

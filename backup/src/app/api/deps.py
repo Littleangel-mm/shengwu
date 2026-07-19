@@ -149,6 +149,24 @@ def require_project_editor(
     return actor_id
 
 
+def require_project_admin(
+    project_id: UUID,
+    db: DbSession,
+    actor_id: CurrentActorId,
+) -> UUID:
+    roles = _project_role(db, project_id, actor_id)
+    if not roles:
+        raise AppError(code="project_not_found", message="项目不存在", status_code=404)
+    project_role, organization_role = roles
+    if project_role != "owner" and organization_role not in {"owner", "admin"}:
+        raise AppError(
+            code="project_admin_required",
+            message="需要项目所有者或组织管理员权限",
+            status_code=403,
+        )
+    return actor_id
+
+
 def require_project_access(
     request: Request,
     project_id: UUID,
@@ -209,6 +227,7 @@ def authorize_conversion_rule_write(
 
 ProjectMember = Annotated[UUID, Depends(require_project_member)]
 ProjectEditor = Annotated[UUID, Depends(require_project_editor)]
+ProjectAdmin = Annotated[UUID, Depends(require_project_admin)]
 ProjectAccess = Annotated[UUID, Depends(require_project_access)]
 OrganizationMember = Annotated[UUID, Depends(require_organization_member)]
 OrganizationAdmin = Annotated[UUID, Depends(require_organization_admin)]

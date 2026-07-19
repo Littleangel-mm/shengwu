@@ -1,0 +1,48 @@
+{
+  "documents": [
+    {"id": "doc-ok", "parsed": true, "evidence_locatable": true},
+    {"id": "doc-partial", "parsed": true, "evidence_locatable": false}
+  ],
+  "fields": [
+    {"id": "field-ok", "value": " 叶面积 "},
+    {"id": "field-wrong", "value": "24 h"}
+  ],
+  "numbers": [
+    {"id": "number-ok", "value": 10.15, "unit": "mg/L"},
+    {"id": "number-wrong", "value": 20.5, "unit": "°C"}
+  ],
+  "associations": [
+    {
+      "id": "association-ok",
+      "treatment_group": "A",
+      "timepoint": "24 H",
+      "condition": "dark"
+    },
+    {
+      "id": "association-wrong",
+      "treatment_group": "B",
+      "timepoint": "24 h",
+      "condition": "light"
+    }
+  ],
+  "tables": [
+    {
+      "id": "table-ok",
+      "headers": [["group", "value"]],
+      "merged_cells": [],
+      "footnotes": ["mean"],
+      "cells": [["A", "1.0"]]
+    },
+    {
+      "id": "table-wrong",
+      "headers": [["group", "value"]],
+      "merged_cells": [],
+      "footnotes": [],
+      "cells": [["B", "2.0"]]
+    }
+  ],
+  "translations": [
+    {"id": "translation-ok", "translation": "leaf area increased"},
+    {"id": "translation-wrong", "translation": "root mass increased"}
+  ]
+}

@@ -3,12 +3,12 @@ from collections.abc import Callable
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import delete, exists, func, insert, select, update
+from sqlalchemy import delete, exists, func, insert, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.core.errors import AppError
 from app.db.tables import table
-from app.models import Document, DocumentVersion, ProcessingJob
+from app.models import Document, DocumentVersion, ProcessingJob, Project
 from app.schemas.workflow import ExtractionCreate, ExtractionRecordReview, TaskAccepted
 
 NUMBER = r"[-+]?\d+(?:\.\d+)?"
@@ -29,6 +29,23 @@ def parse_numeric(raw: str) -> dict[str, Any]:
     if any(mark in raw for mark in ("~", "～", "—", "–")) or ("-" in raw[1:] and len(values) > 1):
         return {"type": "range", "min": min(values), "max": max(values), "mid": sum(values[:2]) / 2}
     return {"type": "number", "value": values[0] if values else None}
+
+
+def normalize_unit_token(value: str | None) -> str:
+    token = re.sub(r"\s+", "", value or "").casefold()
+    return token.replace("℃", "°c")
+
+
+def convert_parsed_value(
+    parsed: dict[str, Any], multiplier: float, offset: float
+) -> dict[str, Any]:
+    result = dict(parsed)
+    for key in ("value", "mean", "min", "max", "mid"):
+        if result.get(key) is not None:
+            result[key] = float(result[key]) * multiplier + offset
+    if result.get("sd") is not None:
+        result["sd"] = float(result["sd"]) * abs(multiplier)
+    return result
 
 
 class ExtractionService:
@@ -263,6 +280,113 @@ class ExtractionService:
         self.db.commit()
         return dict(row)
 
+    def list_conversions(
+        self, project_id: UUID, run_id: UUID, record_id: UUID
+    ) -> list[dict[str, Any]]:
+        runs = table(self.db, "extraction_runs")
+        records = table(self.db, "extraction_records")
+        conversions = table(self.db, "conversion_records")
+        if not self.db.scalar(
+            select(records.c.id)
+            .join(runs, runs.c.id == records.c.extraction_run_id)
+            .where(
+                records.c.id == record_id,
+                records.c.extraction_run_id == run_id,
+                runs.c.project_id == project_id,
+            )
+        ):
+            raise AppError(
+                code="extraction_record_not_found", message="抽取记录不存在", status_code=404
+            )
+        return [
+            dict(row)
+            for row in self.db.execute(
+                select(conversions)
+                .where(conversions.c.extraction_record_id == record_id)
+                .order_by(conversions.c.created_at)
+            ).mappings()
+        ]
+
+    def confirm_conversion(
+        self,
+        project_id: UUID,
+        run_id: UUID,
+        record_id: UUID,
+        conversion_id: UUID,
+        actor_id: UUID | None,
+    ) -> dict[str, Any]:
+        runs = table(self.db, "extraction_runs")
+        records = table(self.db, "extraction_records")
+        conversions = table(self.db, "conversion_records")
+        conversion = (
+            self.db.execute(
+                select(conversions)
+                .join(records, records.c.id == conversions.c.extraction_record_id)
+                .join(runs, runs.c.id == records.c.extraction_run_id)
+                .where(
+                    conversions.c.id == conversion_id,
+                    conversions.c.extraction_record_id == record_id,
+                    records.c.extraction_run_id == run_id,
+                    runs.c.project_id == project_id,
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if not conversion:
+            raise AppError(
+                code="conversion_record_not_found", message="换算记录不存在", status_code=404
+            )
+        if conversion["status"] != "pending":
+            raise AppError(
+                code="conversion_not_pending", message="换算记录不是待确认状态", status_code=409
+            )
+        self.db.execute(
+            update(records)
+            .where(records.c.id == record_id)
+            .values(
+                normalized_value=conversion["target_value"],
+                normalized_unit_id=conversion["target_unit_id"],
+                updated_at=func.now(),
+            )
+        )
+        self.db.execute(
+            update(conversions)
+            .where(conversions.c.id == conversion_id)
+            .values(status="confirmed", confirmed_by=actor_id, confirmed_at=func.now())
+        )
+        if conversion["dataset_cell_id"] is not None:
+            dataset_cells = table(self.db, "dataset_cells")
+            dataset_rows = table(self.db, "dataset_rows")
+            dataset_versions = table(self.db, "dataset_versions")
+            is_draft = self.db.scalar(
+                select(dataset_cells.c.id)
+                .join(dataset_rows, dataset_rows.c.id == dataset_cells.c.row_id)
+                .join(
+                    dataset_versions,
+                    dataset_versions.c.id == dataset_rows.c.dataset_version_id,
+                )
+                .where(
+                    dataset_cells.c.id == conversion["dataset_cell_id"],
+                    dataset_versions.c.status == "draft",
+                )
+            )
+            if is_draft:
+                self.db.execute(
+                    update(dataset_cells)
+                    .where(dataset_cells.c.id == conversion["dataset_cell_id"])
+                    .values(
+                        normalized_value=conversion["target_value"],
+                        unit_id=conversion["target_unit_id"],
+                    )
+                )
+        self.db.commit()
+        return dict(
+            self.db.execute(
+                select(conversions).where(conversions.c.id == conversion_id)
+            ).mappings().one()
+        )
+
     @staticmethod
     def _dimension_keys(text_value: str, fallback: str) -> tuple[str, str | None]:
         dimensions = ExtractionService._dimension_metadata(text_value)
@@ -310,6 +434,9 @@ class ExtractionService:
         figures = table(self.db, "document_figures")
         records = table(self.db, "extraction_records")
         evidence = table(self.db, "extraction_evidence")
+        conversions = table(self.db, "conversion_records")
+        units = table(self.db, "units")
+        conversion_rules = table(self.db, "unit_conversion_rules")
         search_results = table(self.db, "search_results")
         run = self.db.execute(select(runs).where(runs.c.id == run_id)).mappings().one_or_none()
         if not run:
@@ -326,9 +453,31 @@ class ExtractionService:
         ]
         if not field_rows:
             raise AppError(code="field_schema_empty", message="字段方案没有字段", status_code=422)
+        old_record_ids = select(records.c.id).where(records.c.extraction_run_id == run_id)
+        self.db.execute(
+            delete(conversions).where(
+                conversions.c.extraction_record_id.in_(old_record_ids),
+                conversions.c.dataset_cell_id.is_(None),
+            )
+        )
         self.db.execute(delete(records).where(records.c.extraction_run_id == run_id))
         self.db.execute(update(runs).where(runs.c.id == run_id).values(status="running"))
         self.db.commit()
+        unit_rows = [
+            dict(row)
+            for row in self.db.execute(
+                select(units).where(units.c.is_active.is_(True))
+            ).mappings()
+        ]
+        units_by_token: dict[str, dict[str, Any]] = {}
+        for unit in unit_rows:
+            names = [unit["code"], unit["symbol"], unit["name"], *(unit["aliases"] or [])]
+            for name in names:
+                if token := normalize_unit_token(str(name)):
+                    units_by_token[token] = unit
+        organization_id = self.db.scalar(
+            select(Project.organization_id).where(Project.id == run["project_id"])
+        )
 
         block_query = (
             select(
@@ -569,6 +718,7 @@ class ExtractionService:
                 for match_no, match in enumerate(pattern.finditer(text_value), start=1):
                     raw_value = match.group("value")
                     parsed = parse_numeric(raw_value)
+                    raw_unit = match.group("unit")
                     numeric = first_not_none(
                         parsed.get("value"), parsed.get("mean"), parsed.get("mid")
                     )
@@ -581,6 +731,63 @@ class ExtractionService:
                     sample_key = f"{context['document_version_id']}:{group_key}:{field['field_key']}:{match_no}"[
                         :255
                     ]
+                    normalized_value: dict[str, Any] = {}
+                    normalized_unit_id = None
+                    conversion: dict[str, Any] | None = None
+                    source_unit = units_by_token.get(normalize_unit_token(raw_unit))
+                    preferred_unit_id = field["preferred_unit_id"]
+                    if source_unit and preferred_unit_id:
+                        if source_unit["id"] == preferred_unit_id:
+                            normalized_value = parsed
+                            normalized_unit_id = preferred_unit_id
+                            conversion = {
+                                "rule_id": None,
+                                "target_value": parsed,
+                                "formula_used": "identity",
+                                "status": "applied",
+                            }
+                        else:
+                            candidate_rules = [
+                                dict(item)
+                                for item in self.db.execute(
+                                    select(conversion_rules).where(
+                                        conversion_rules.c.source_unit_id
+                                        == source_unit["id"],
+                                        conversion_rules.c.target_unit_id
+                                        == preferred_unit_id,
+                                        conversion_rules.c.is_active.is_(True),
+                                        or_(
+                                            conversion_rules.c.organization_id
+                                            == organization_id,
+                                            conversion_rules.c.organization_id.is_(None),
+                                        ),
+                                    )
+                                ).mappings()
+                            ]
+                            candidate_rules.sort(
+                                key=lambda item: (
+                                    item["organization_id"] == organization_id,
+                                    item["version"],
+                                ),
+                                reverse=True,
+                            )
+                            rule = candidate_rules[0] if candidate_rules else None
+                            if rule and rule["multiplier"] is not None:
+                                multiplier = float(rule["multiplier"])
+                                offset = float(rule["offset_value"] or 0)
+                                target_value = convert_parsed_value(parsed, multiplier, offset)
+                                status = (
+                                    "pending" if rule["requires_confirmation"] else "applied"
+                                )
+                                conversion = {
+                                    "rule_id": rule["id"],
+                                    "target_value": target_value,
+                                    "formula_used": f"value * {multiplier} + {offset}",
+                                    "status": status,
+                                }
+                                if status == "applied":
+                                    normalized_value = target_value
+                                    normalized_unit_id = preferred_unit_id
                     record_id = self.db.execute(
                         insert(records)
                         .values(
@@ -591,10 +798,11 @@ class ExtractionService:
                             group_key=group_key[:255],
                             timepoint_key=timepoint_key,
                             raw_value=raw_value,
-                            raw_unit_text=match.group("unit"),
+                            raw_unit_text=raw_unit,
                             parsed_value=parsed,
-                            normalized_value={},
+                            normalized_value=normalized_value,
                             ml_value={"value": numeric} if numeric is not None else {},
+                            normalized_unit_id=normalized_unit_id,
                             value_type=parsed["type"],
                             numeric_value=numeric,
                             range_min=parsed.get("min"),
@@ -618,6 +826,22 @@ class ExtractionService:
                         )
                         .returning(records.c.id)
                     ).scalar_one()
+                    if conversion and source_unit:
+                        self.db.execute(
+                            insert(conversions).values(
+                                project_id=run["project_id"],
+                                extraction_record_id=record_id,
+                                rule_id=conversion["rule_id"],
+                                source_value=parsed,
+                                source_unit_text=raw_unit,
+                                source_unit_id=source_unit["id"],
+                                target_value=conversion["target_value"],
+                                target_unit_id=preferred_unit_id,
+                                formula_used=conversion["formula_used"],
+                                context_used={"dimensions": dimensions},
+                                status=conversion["status"],
+                            )
+                        )
                     self.db.execute(
                         insert(evidence).values(
                             extraction_record_id=record_id,

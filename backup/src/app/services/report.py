@@ -68,6 +68,8 @@ class ReportService:
             requested_by=actor_id,
         )
         self.db.add(job)
+        self.db.flush()
+        self.db.execute(update(reports).where(reports.c.id == report_id).values(job_id=job.id))
         self.db.commit()
         return TaskAccepted(resource_id=report_id, job_id=job.id)
 
@@ -129,6 +131,37 @@ class ReportService:
                 .order_by(reports.c.created_at.desc())
             ).mappings()
         ]
+
+    def get(self, project_id: UUID, report_id: UUID) -> dict:
+        reports = table(self.db, "reports")
+        report_assets = table(self.db, "report_assets")
+        row = (
+            self.db.execute(
+                select(reports).where(
+                    reports.c.id == report_id,
+                    reports.c.project_id == project_id,
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if not row:
+            raise AppError(code="report_not_found", message="报告不存在", status_code=404)
+        result = dict(row)
+        result["assets"] = [
+            dict(asset)
+            for asset in self.db.execute(
+                select(report_assets)
+                .where(report_assets.c.report_id == report_id)
+                .order_by(report_assets.c.position, report_assets.c.created_at)
+            ).mappings()
+        ]
+        result["download_ready"] = bool(row["output_file_id"] and row["status"] == "completed")
+        return result
+
+    @staticmethod
+    def _evidence_truncation_notice() -> str:
+        return "证据索引超过 1000 条，本 Word 报告仅展示前 1000 条；完整证据请在系统中查看。"
 
     @staticmethod
     def _pyplot() -> Any:
@@ -566,8 +599,12 @@ class ReportService:
             .join(pages, pages.c.id == cell_evidence.c.page_id)
             .where(dataset_rows.c.dataset_version_id == version["id"])
             .order_by(documents.c.title, pages.c.page_no)
-            .limit(1000)
+            .limit(1001)
         ).all()
+        evidence_truncated = len(evidence_rows) > 1000
+        evidence_rows = evidence_rows[:1000]
+        if evidence_truncated:
+            document.add_paragraph(self._evidence_truncation_notice())
         if evidence_rows:
             evidence_table = document.add_table(rows=1, cols=4)
             for index, title in enumerate(["文献", "页码", "原文证据", "坐标"]):

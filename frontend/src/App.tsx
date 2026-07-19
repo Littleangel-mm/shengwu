@@ -35,6 +35,7 @@ import {
   Table2,
   Trash2,
   Upload,
+  Users,
   UserRound,
   X,
 } from 'lucide-react'
@@ -67,6 +68,7 @@ import {
   type FieldSchema,
   type ExtractionRecord,
   type JobItem,
+  type MLModel,
   type Project,
   type SearchMode,
   type SearchRun,
@@ -75,6 +77,7 @@ import {
   session,
   type User,
 } from './lib/api'
+import { resolveProjectAccess } from './lib/permissions'
 
 type AuthState = {
   user: User | null
@@ -84,11 +87,20 @@ type AuthState = {
 }
 
 const AuthContext = createContext<AuthState | null>(null)
+const ProjectAccessContext = createContext({
+  canWrite: false,
+  canManageMembers: false,
+  role: 'owner',
+})
 
 function useAuth() {
   const value = useContext(AuthContext)
   if (!value) throw new Error('AuthContext is unavailable')
   return value
+}
+
+function useProjectAccess() {
+  return useContext(ProjectAccessContext)
 }
 
 function AuthProvider({ children }: { children: ReactNode }) {
@@ -149,7 +161,7 @@ function Brand({ compact = false }: { compact?: boolean }) {
   )
 }
 
-function StatusPill({ value }: { value: unknown }) {
+export function StatusPill({ value }: { value: unknown }) {
   const text = String(value || 'unknown')
   const labels: Record<string, string> = {
     ready: '就绪',
@@ -759,6 +771,7 @@ const workspaceNav = [
   { key: 'datasets', label: '数据集', icon: Database },
   { key: 'models', label: '模型实验', icon: BrainCircuit },
   { key: 'reports', label: '研究报告', icon: BarChart3 },
+  { key: 'members', label: '成员权限', icon: Users },
   { key: 'audit', label: '审计记录', icon: ShieldCheck },
 ]
 
@@ -770,9 +783,16 @@ function WorkspacePage() {
     queryFn: () => api.project(projectId),
     enabled: Boolean(projectId),
   })
+  const membership = useQuery({
+    queryKey: ['project-membership', projectId],
+    queryFn: () => api.projectMembership(projectId),
+    enabled: Boolean(projectId),
+  })
+  const access = resolveProjectAccess(membership.data)
 
   return (
-    <div className="workspace">
+    <ProjectAccessContext.Provider value={access}>
+    <div className={`workspace ${access.canWrite ? '' : 'read-only'}`}>
       <aside className={`workspace-sidebar ${mobileNav ? 'open' : ''}`}>
         <div className="sidebar-brand">
           <Brand />
@@ -820,6 +840,7 @@ function WorkspacePage() {
               : workspaceNav.find((item) => item.key === section)?.label || '项目概览'
           }
         />
+        {!access.canWrite && <div className="read-only-banner"><LockKeyhole size={14} /> 当前角色为 {access.role}，项目内容只读</div>}
         {documentId ? (
           <DocumentDetailSection projectId={projectId} documentId={documentId} />
         ) : datasetId && datasetVersionId ? (
@@ -833,6 +854,7 @@ function WorkspacePage() {
         )}
       </main>
     </div>
+    </ProjectAccessContext.Provider>
   )
 }
 
@@ -851,17 +873,9 @@ function WorkspaceSection({
   if (section === 'terms') return <TermsSection projectId={projectId} />
   if (section === 'extraction') return <ExtractionSection projectId={projectId} />
   if (section === 'datasets') return <DatasetsSection projectId={projectId} />
-  if (section === 'models')
-    return (
-      <RecordsSection
-        title="智能建模实验室"
-        eyebrow="预测与优化"
-        description="比较训练运行、模型指标与优化结果。"
-        queryKey={['ml-runs', projectId]}
-        queryFn={() => api.mlRuns(projectId)}
-      />
-    )
+  if (section === 'models') return <MLSection projectId={projectId} />
   if (section === 'reports') return <ReportsSection projectId={projectId} />
+  if (section === 'members') return <MembersSection projectId={projectId} project={project} />
   if (section === 'audit')
     return (
       <RecordsSection
@@ -2789,10 +2803,361 @@ function DatasetWorkbench({
   )
 }
 
+function MLSection({ projectId }: { projectId: string }) {
+  const queryClient = useQueryClient()
+  const { canWrite } = useProjectAccess()
+  const [datasetVersionId, setDatasetVersionId] = useState('')
+  const [runName, setRunName] = useState('')
+  const [taskType, setTaskType] = useState<'regression' | 'classification'>('regression')
+  const [inputFields, setInputFields] = useState<string[]>([])
+  const [targetField, setTargetField] = useState('')
+  const [algorithms, setAlgorithms] = useState<string[]>(['ridge', 'random_forest'])
+  const [selectedRunId, setSelectedRunId] = useState('')
+  const [predictionValues, setPredictionValues] = useState('{}')
+  const [predictionResult, setPredictionResult] = useState<unknown>(null)
+  const [optimizationConstraints, setOptimizationConstraints] = useState('{}')
+  const [selectedOptimizationId, setSelectedOptimizationId] = useState('')
+  const [selectedJob, setSelectedJob] = useState<JobItem | null>(null)
+  const datasets = useQuery({
+    queryKey: ['datasets', projectId],
+    queryFn: () => api.datasets(projectId),
+  })
+  const dataset = useQuery({
+    queryKey: ['dataset-version', projectId, datasetVersionId],
+    queryFn: () => api.datasetVersion(projectId, datasetVersionId),
+    enabled: Boolean(datasetVersionId),
+  })
+  const runs = useQuery({
+    queryKey: ['ml-runs', projectId],
+    queryFn: () => api.mlRuns(projectId),
+    refetchInterval: 4_000,
+  })
+  useEffect(() => {
+    if (!selectedRunId && runs.data?.[0]) setSelectedRunId(runs.data[0].id)
+  }, [runs.data, selectedRunId])
+  const run = useQuery({
+    queryKey: ['ml-run', projectId, selectedRunId],
+    queryFn: () => api.mlRun(projectId, selectedRunId),
+    enabled: Boolean(selectedRunId),
+    refetchInterval: (query) =>
+      query.state.data && ['queued', 'running'].includes(query.state.data.status) ? 3_000 : false,
+  })
+  const jobs = useQuery({
+    queryKey: ['jobs', projectId],
+    queryFn: () => api.jobs(projectId),
+    refetchInterval: 4_000,
+  })
+  const optimizations = useQuery({
+    queryKey: ['optimization-runs', projectId],
+    queryFn: () => api.optimizationRuns(projectId),
+    refetchInterval: 4_000,
+  })
+  const optimization = useQuery({
+    queryKey: ['optimization', projectId, selectedOptimizationId],
+    queryFn: () => api.optimization(projectId, selectedOptimizationId),
+    enabled: Boolean(selectedOptimizationId),
+  })
+  const createRun = useMutation({
+    mutationFn: () =>
+      api.createMlRun(projectId, {
+        name: runName,
+        dataset_version_id: datasetVersionId,
+        task_type: taskType,
+        input_field_ids: inputFields,
+        target_field_id: targetField,
+        algorithms,
+        random_seed: 42,
+        test_size: 0.2,
+        numeric_imputer: 'median',
+        scaler: 'standard',
+        cv_folds: 5,
+        parameter_search: true,
+        explain: true,
+        split_strategy: 'group_shuffle_split',
+      }),
+    onSuccess: async (accepted) => {
+      setSelectedRunId(accepted.resource_id)
+      setRunName('')
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['ml-runs', projectId] }),
+        queryClient.invalidateQueries({ queryKey: ['jobs', projectId] }),
+      ])
+    },
+  })
+  const selectModel = useMutation({
+    mutationFn: (modelId: string) => api.selectMlModel(projectId, selectedRunId, modelId),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['ml-run', projectId, selectedRunId] }),
+  })
+  const predict = useMutation({
+    mutationFn: (modelIds: string[]) => {
+      const values = JSON.parse(predictionValues) as Record<string, unknown>
+      return modelIds.length === 1
+        ? api.predict(projectId, modelIds[0], values)
+        : api.predictMany(projectId, modelIds, values)
+    },
+    onSuccess: setPredictionResult,
+  })
+  const createOptimization = useMutation({
+    mutationFn: (model: MLModel) =>
+      api.createOptimization(projectId, {
+        name: `${run.data?.name || '模型'}方案优化`,
+        ml_model_id: model.id,
+        objective: { direction: 'maximize' },
+        constraints: JSON.parse(optimizationConstraints) as Record<string, Record<string, unknown>>,
+        sample_count: 3000,
+        top_n: 20,
+        random_seed: 42,
+      }),
+    onSuccess: async (accepted) => {
+      setSelectedOptimizationId(accepted.resource_id)
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['optimization-runs', projectId] }),
+        queryClient.invalidateQueries({ queryKey: ['jobs', projectId] }),
+      ])
+    },
+  })
+  const availableAlgorithms =
+    taskType === 'regression'
+      ? ['ridge', 'pls', 'svr', 'random_forest', 'gradient_boosting', 'xgboost', 'mlp']
+      : ['logistic', 'svc', 'random_forest', 'gradient_boosting', 'xgboost', 'mlp']
+  const models = run.data?.models || []
+  const selectedModel = models.find((model) => model.is_selected) || models[0]
+  const trainingJob = jobs.data?.items.find(
+    (job) => job.job_type === 'train_model' && (!run.data?.job_id || job.id === run.data.job_id),
+  )
+
+  return (
+    <div className="workspace-content">
+      <SectionIntro
+        eyebrow="预测与方案优化"
+        title="智能建模实验室"
+        description="从冻结数据集训练可解释模型，执行预测并搜索最优实验条件。"
+      />
+      <section className="ml-create glass">
+        <PanelHeading eyebrow="训练配置" title="创建模型运行" />
+        <div className="ml-config-grid">
+          <label><span>运行名称</span><input value={runName} onChange={(event) => setRunName(event.target.value)} placeholder="产率预测模型" /></label>
+          <label><span>冻结数据集</span><select value={datasetVersionId} onChange={(event) => {
+            setDatasetVersionId(event.target.value); setInputFields([]); setTargetField('')
+          }}><option value="">选择版本</option>{datasets.data?.filter((item) => item.latest_version_status === 'frozen').map((item) =>
+            <option value={item.latest_version_id} key={item.id}>{item.name} · V{item.latest_version_no}</option>
+          )}</select></label>
+          <label><span>任务类型</span><select value={taskType} onChange={(event) => {
+            const next = event.target.value as 'regression' | 'classification'
+            setTaskType(next)
+            setAlgorithms(next === 'regression' ? ['ridge', 'random_forest'] : ['logistic', 'random_forest'])
+          }}><option value="regression">回归</option><option value="classification">分类</option></select></label>
+          <label><span>目标字段</span><select value={targetField} onChange={(event) => setTargetField(event.target.value)}><option value="">选择目标</option>{dataset.data?.fields.map((field) =>
+            <option value={field.id} key={field.id}>{field.display_name}</option>
+          )}</select></label>
+        </div>
+        <div className="field-choice-grid">
+          <div><span>输入字段</span>{dataset.data?.fields.filter((field) => field.id !== targetField).map((field) =>
+            <label key={field.id}><input type="checkbox" checked={inputFields.includes(field.id)} onChange={() => setInputFields((current) =>
+              current.includes(field.id) ? current.filter((id) => id !== field.id) : [...current, field.id]
+            )} /> {field.display_name}</label>
+          )}</div>
+          <div><span>算法</span>{availableAlgorithms.map((algorithm) =>
+            <label key={algorithm}><input type="checkbox" checked={algorithms.includes(algorithm)} onChange={() => setAlgorithms((current) =>
+              current.includes(algorithm) ? current.filter((item) => item !== algorithm) : [...current, algorithm]
+            )} /> {algorithm}</label>
+          )}</div>
+        </div>
+        <div className="editor-actions">
+          <button className="button button-primary" disabled={!canWrite || !runName || !datasetVersionId || !targetField || !inputFields.length || !algorithms.length || createRun.isPending} onClick={() => createRun.mutate()}>
+            <BrainCircuit size={15} /> 开始训练
+          </button>
+        </div>
+        <ErrorNotice error={createRun.error} />
+      </section>
+      <div className="ml-workbench">
+        <aside className="search-history glass">
+          <PanelHeading eyebrow="训练历史" title={`${runs.data?.length || 0} 次运行`} />
+          <div className="search-run-list">{runs.data?.map((item) =>
+            <button key={item.id} className={item.id === selectedRunId ? 'active' : ''} onClick={() => setSelectedRunId(item.id)}>
+              <span><strong>{item.name}</strong><small>{item.task_type}</small></span><StatusPill value={item.status} />
+            </button>
+          )}</div>
+        </aside>
+        <section className="ml-results glass">
+          <div className="panel-title-row">
+            <div><span className="eyebrow">模型对比</span><h3>{run.data?.name || '选择训练运行'}</h3></div>
+            {trainingJob && <button className="mini-button" onClick={() => setSelectedJob(trainingJob)}>查看训练日志</button>}
+          </div>
+          <ErrorNotice error={run.error || selectModel.error} />
+          {run.isLoading ? <LoadingPane /> : models.length ? (
+            <div className="model-grid">{models.map((model) => (
+              <article className={`model-card ${model.is_selected ? 'selected' : ''}`} key={model.id}>
+                <header><strong>{model.algorithm_code}</strong><StatusPill value={model.is_selected ? 'selected' : 'candidate'} /></header>
+                <div className="metric-list">{model.metrics.map((metric) =>
+                  <div key={metric.id}><span>{metric.split_name} · {metric.metric_name}</span><strong>{Number(metric.metric_value).toFixed(4)}</strong></div>
+                )}</div>
+                <div className="importance-list">{model.explanations.flatMap((explanation) => explanation.explanation_data.features || []).slice(0, 6).map((feature, index) =>
+                  <div key={index}><span>{feature.feature || feature.name || `特征${index + 1}`}</span><i style={{ width: `${Math.min(100, Math.abs(Number(feature.importance ?? feature.value ?? 0)) * 100)}%` }} /></div>
+                )}</div>
+                <footer>
+                  {!model.is_selected && <button className="mini-button" disabled={!canWrite} onClick={() => selectModel.mutate(model.id)}>选择模型</button>}
+                </footer>
+              </article>
+            ))}</div>
+          ) : <EmptyInline text={selectedRunId ? '训练尚未完成或暂无模型' : '请选择训练运行'} />}
+          {selectedModel && (
+            <div className="model-actions-panel">
+              <PanelHeading eyebrow="预测与优化" title={`当前模型：${selectedModel.algorithm_code}`} />
+              <label><span>预测输入（JSON，键使用字段 key）</span><textarea value={predictionValues} onChange={(event) => setPredictionValues(event.target.value)} rows={4} /></label>
+              <div className="button-row">
+                <button className="button button-secondary" disabled={!canWrite} onClick={() => predict.mutate([selectedModel.id])}>单模型预测</button>
+                <button className="button button-secondary" disabled={!canWrite} onClick={() => predict.mutate(models.map((model) => model.id))}>多模型预测</button>
+              </div>
+              {predictionResult != null && <pre className="result-json">{JSON.stringify(predictionResult, null, 2)}</pre>}
+              <label><span>优化变量范围（JSON，如 {`{"temperature":{"min":20,"max":35}}`}）</span><textarea value={optimizationConstraints} onChange={(event) => setOptimizationConstraints(event.target.value)} rows={4} /></label>
+              <button className="button button-primary" disabled={!canWrite || run.data?.task_type !== 'regression' || createOptimization.isPending} onClick={() => createOptimization.mutate(selectedModel)}>创建优化任务</button>
+              <ErrorNotice error={predict.error || createOptimization.error} />
+            </div>
+          )}
+          {optimizations.data?.length ? (
+            <div className="optimization-list">
+              <select value={selectedOptimizationId} onChange={(event) => setSelectedOptimizationId(event.target.value)}>
+                <option value="">选择优化运行</option>{optimizations.data.map((item) => <option value={item.id} key={item.id}>{item.name} · {item.status}</option>)}
+              </select>
+              {optimization.data?.candidates?.map((candidate) => (
+                <article key={candidate.id}><strong>#{candidate.rank_no}</strong><span>{JSON.stringify(candidate.input_values)}</span><span>{JSON.stringify(candidate.predicted_values)}</span><small>{JSON.stringify(candidate.uncertainty)}</small></article>
+              ))}
+            </div>
+          ) : null}
+        </section>
+      </div>
+      <AnimatePresence>{selectedJob && <TaskLogModal projectId={projectId} job={selectedJob} onClose={() => setSelectedJob(null)} />}</AnimatePresence>
+    </div>
+  )
+}
+
+function MembersSection({ projectId, project }: { projectId: string; project?: Project }) {
+  const queryClient = useQueryClient()
+  const access = useProjectAccess()
+  const [scope, setScope] = useState<'project' | 'organization'>('project')
+  const [email, setEmail] = useState('')
+  const [role, setRole] = useState('viewer')
+  const projectMembers = useQuery({
+    queryKey: ['project-members', projectId],
+    queryFn: () => api.projectMembers(projectId),
+  })
+  const organizationMembers = useQuery({
+    queryKey: ['organization-members', project?.organization_id],
+    queryFn: () => api.organizationMembers(project!.organization_id),
+    enabled: Boolean(project?.organization_id),
+  })
+  const members = scope === 'project' ? projectMembers.data || [] : organizationMembers.data || []
+  const invalidate = () =>
+    Promise.all([
+      queryClient.invalidateQueries({ queryKey: ['project-members', projectId] }),
+      queryClient.invalidateQueries({ queryKey: ['organization-members', project?.organization_id] }),
+      queryClient.invalidateQueries({ queryKey: ['project-membership', projectId] }),
+    ])
+  const invite = useMutation({
+    mutationFn: () =>
+      scope === 'project'
+        ? api.inviteProjectMember(projectId, email, role)
+        : api.inviteOrganizationMember(project!.organization_id, email, role),
+    onSuccess: async () => {
+      setEmail('')
+      await invalidate()
+    },
+  })
+  const update = useMutation({
+    mutationFn: ({ userId, nextRole }: { userId: string; nextRole: string }) =>
+      scope === 'project'
+        ? api.updateProjectMember(projectId, userId, nextRole)
+        : api.updateOrganizationMember(project!.organization_id, userId, nextRole),
+    onSuccess: invalidate,
+  })
+  const remove = useMutation({
+    mutationFn: (userId: string) =>
+      scope === 'project'
+        ? api.removeProjectMember(projectId, userId)
+        : api.removeOrganizationMember(project!.organization_id, userId),
+    onSuccess: invalidate,
+  })
+
+  return (
+    <div className="workspace-content">
+      <SectionIntro
+        eyebrow="协作与权限"
+        title="成员管理"
+        description="邀请组织或项目成员，并按职责分配只读、编辑和管理权限。"
+        action={
+          <div className="segment-tabs">
+            <button className={scope === 'project' ? 'active' : ''} onClick={() => { setScope('project'); setRole('viewer') }}>项目成员</button>
+            <button className={scope === 'organization' ? 'active' : ''} onClick={() => { setScope('organization'); setRole('member') }}>组织成员</button>
+          </div>
+        }
+      />
+      {access.canManageMembers && (
+        <form className="member-invite glass" onSubmit={(event) => { event.preventDefault(); invite.mutate() }}>
+          <input type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="成员邮箱" required />
+          <select value={role} onChange={(event) => setRole(event.target.value)}>
+            {scope === 'project' ? (
+              <><option value="viewer">只读成员</option><option value="editor">编辑者</option><option value="owner">项目所有者</option></>
+            ) : (
+              <><option value="member">组织成员</option><option value="admin">组织管理员</option><option value="owner">组织所有者</option></>
+            )}
+          </select>
+          <button className="button button-primary" disabled={invite.isPending}><Plus size={14} /> 邀请成员</button>
+        </form>
+      )}
+      <ErrorNotice error={invite.error || update.error || remove.error || projectMembers.error || organizationMembers.error} />
+      <section className="panel glass">
+        <PanelHeading eyebrow={scope === 'project' ? '项目访问控制' : '组织访问控制'} title={`${members.length} 位成员`} />
+        {members.length ? (
+          <div className="member-list">{members.map((member) => (
+            <article key={member.user_id}>
+              <span className="member-avatar">{member.display_name?.slice(0, 1) || member.email.slice(0, 1).toUpperCase()}</span>
+              <div><strong>{member.display_name || member.email}</strong><small>{member.email}</small></div>
+              <StatusPill value={member.status} />
+              <select
+                value={member.role}
+                disabled={!access.canManageMembers}
+                onChange={(event) => update.mutate({ userId: member.user_id, nextRole: event.target.value })}
+              >
+                {(scope === 'project' ? ['viewer', 'editor', 'owner'] : ['member', 'admin', 'owner']).map((value) => <option value={value} key={value}>{value}</option>)}
+              </select>
+              {access.canManageMembers && <button className="mini-button exclude" onClick={() => {
+                if (window.confirm(`确认移除 ${member.email}？`)) remove.mutate(member.user_id)
+              }}><Trash2 size={13} /> 移除</button>}
+            </article>
+          ))}</div>
+        ) : <EmptyInline text="暂无成员或无权查看" />}
+      </section>
+    </div>
+  )
+}
+
 function ReportsSection({ projectId }: { projectId: string }) {
+  const queryClient = useQueryClient()
+  const { canWrite } = useProjectAccess()
+  const [title, setTitle] = useState('')
+  const [datasetVersionId, setDatasetVersionId] = useState('')
+  const [mlRunId, setMlRunId] = useState('')
+  const [optimizationRunId, setOptimizationRunId] = useState('')
+  const [selectedJob, setSelectedJob] = useState<JobItem | null>(null)
   const reports = useQuery({
     queryKey: ['reports', projectId],
     queryFn: () => api.reports(projectId),
+    refetchInterval: 4_000,
+  })
+  const datasets = useQuery({ queryKey: ['datasets', projectId], queryFn: () => api.datasets(projectId) })
+  const mlRuns = useQuery({ queryKey: ['ml-runs', projectId], queryFn: () => api.mlRuns(projectId) })
+  const optimizations = useQuery({ queryKey: ['optimization-runs', projectId], queryFn: () => api.optimizationRuns(projectId) })
+  const jobs = useQuery({ queryKey: ['jobs', projectId], queryFn: () => api.jobs(projectId), refetchInterval: 4_000 })
+  const create = useMutation({
+    mutationFn: () => api.createReport(projectId, title, datasetVersionId, mlRunId || undefined, optimizationRunId || undefined),
+    onSuccess: async () => {
+      setTitle('')
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['reports', projectId] }),
+        queryClient.invalidateQueries({ queryKey: ['jobs', projectId] }),
+      ])
+    },
   })
   return (
     <div className="workspace-content">
@@ -2801,6 +3166,23 @@ function ReportsSection({ projectId }: { projectId: string }) {
         title="研究报告"
         description="将数据、模型结果与证据索引汇聚为专业研究报告。"
       />
+      <form className="report-creator glass" onSubmit={(event) => { event.preventDefault(); create.mutate() }}>
+        <input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="报告标题" required />
+        <select value={datasetVersionId} onChange={(event) => setDatasetVersionId(event.target.value)} required>
+          <option value="">选择冻结数据集</option>{datasets.data?.filter((item) => item.latest_version_status === 'frozen').map((item) =>
+            <option value={item.latest_version_id} key={item.id}>{item.name} · V{item.latest_version_no}</option>
+          )}
+        </select>
+        <select value={mlRunId} onChange={(event) => setMlRunId(event.target.value)}>
+          <option value="">不包含模型</option>{mlRuns.data?.filter((item) => item.status === 'completed').map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}
+        </select>
+        <select value={optimizationRunId} onChange={(event) => setOptimizationRunId(event.target.value)}>
+          <option value="">不包含优化</option>{optimizations.data?.filter((item) => item.status === 'completed').map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}
+        </select>
+        <button className="button button-primary" disabled={!canWrite || create.isPending}><FileText size={14} /> 生成报告</button>
+      </form>
+      <ErrorNotice error={create.error} />
+      <p className="report-note">Word 报告包含数据、模型、优化结果和证据索引；证据超过 1000 条时会在报告中明确标记截断。</p>
       <section className="panel glass">
         <PanelHeading eyebrow="已生成报告" title={`共 ${reports.data?.length || 0} 份`} />
         {reports.isLoading ? (
@@ -2817,6 +3199,10 @@ function ReportsSection({ projectId }: { projectId: string }) {
                   <small>{String(report.created_at || '')}</small>
                 </div>
                 <StatusPill value={report.status} />
+                {(() => {
+                  const reportJob = jobs.data?.items.find((job) => job.id === report.job_id)
+                  return reportJob ? <button className="mini-button" onClick={() => setSelectedJob(reportJob)}>日志</button> : null
+                })()}
                 <button
                   className="mini-button"
                   onClick={() =>
@@ -2832,6 +3218,7 @@ function ReportsSection({ projectId }: { projectId: string }) {
           <EmptyInline text="暂无生成报告" />
         )}
       </section>
+      <AnimatePresence>{selectedJob && <TaskLogModal projectId={projectId} job={selectedJob} onClose={() => setSelectedJob(null)} />}</AnimatePresence>
     </div>
   )
 }

@@ -43,6 +43,28 @@
 - 翻译质量由客户指定双语审阅人盲评；执行前必须配置有效的 `DEEPSEEK_API_KEY`。
 - 指标阈值、样本权重、严重缺陷定义和一票否决项必须由客户在测试前确认，测试后不得追溯修改。
 
+## 评估 JSON 与完整性清单
+
+开发预检工具读取 UTF-8 JSON。`expected.json` 与 `actual.json` 顶层可包含以下数组，
+每条记录都必须有唯一字符串 `id`：
+
+- `documents`：actual 记录以 `parsed=true` 且 `evidence_locatable=true` 计为完整。
+- `fields`：双方使用 `value`，忽略大小写和连续空白后比较。
+- `numbers`：expected 使用 `value`、`unit`、可选绝对 `tolerance` 与
+  `relative_tolerance`；允许误差取两种容差中的较大值，单位必须一致。
+- `associations`：比较 `treatment_group`、`timepoint` 和 `condition`，三项全对才计分。
+- `tables`：严格比较 `headers`、`merged_cells`、`footnotes` 和 `cells` 的 JSON 结构。
+- `translations`：expected 使用客户批准的 `reference` 和开发预检 `min_score`，
+  actual 使用 `translation`。工具报告标准化文本的相似度；正式翻译质量仍由客户指定的
+  双语审阅人盲评。
+
+先使用 `gold_standard_manifest.py create` 为 expected、actual 和原始样本生成清单。
+清单包含自身规范化内容的 `manifest_sha256`，以及每个文件的相对路径、大小和 SHA-256。
+导入或评分前必须执行 `verify`；文件缺失、路径越界、大小或摘要不匹配均应终止测试。
+
+JSON 与 Markdown 输出必须连同 manifest、工具版本、执行时间、阈值确认单一起归档。
+仓库中的合成 fixture 仅验证工具行为，不得作为客户真实准确率、客户 UAT 或正式签字证据。
+
 ## 签字确认
 
 | 项目 | 客户填写 |

@@ -8,6 +8,9 @@ from uuid import UUID
 
 import fitz
 from docx import Document as DocxDocument
+from docx.oxml.ns import qn
+from docx.table import Table
+from docx.text.paragraph import Paragraph
 from openpyxl import load_workbook
 from sqlalchemy import delete, insert, select, update
 from sqlalchemy.orm import Session
@@ -77,11 +80,25 @@ class DocumentParser:
                     path.append(last)
             header_paths.append(path)
         merged: list[dict[str, int]] = []
+        seen_geometry: set[tuple[float, ...]] = set()
         for row_index, row in enumerate(getattr(found, "rows", [])):
             cells = list(getattr(row, "cells", []))
             for column_index, cell in enumerate(cells):
                 if cell is None:
                     continue
+                geometry = tuple(round(float(value), 3) for value in cell)
+                if geometry in seen_geometry:
+                    continue
+                seen_geometry.add(geometry)
+                matching = []
+                for candidate_row, found_row in enumerate(getattr(found, "rows", [])):
+                    for candidate_column, candidate in enumerate(
+                        getattr(found_row, "cells", [])
+                    ):
+                        if candidate is not None and tuple(
+                            round(float(value), 3) for value in candidate
+                        ) == geometry:
+                            matching.append((candidate_row, candidate_column))
                 column_span = 1
                 while (
                     column_index + column_span < len(cells)
@@ -94,6 +111,9 @@ class DocumentParser:
                     if column_index >= len(below) or below[column_index] is not None:
                         break
                     row_span += 1
+                if matching:
+                    row_span = max(row for row, _ in matching) - row_index + 1
+                    column_span = max(column for _, column in matching) - column_index + 1
                 if row_span > 1 or column_span > 1:
                     merged.append(
                         {
@@ -162,6 +182,50 @@ class DocumentParser:
             "legend_metadata": {"labels": legend},
         }
 
+    @staticmethod
+    def _docx_body_items(document: Any) -> list[tuple[str, Any]]:
+        items: list[tuple[str, Any]] = []
+        for child in document.element.body.iterchildren():
+            if child.tag == qn("w:p"):
+                items.append(("paragraph", Paragraph(child, document)))
+            elif child.tag == qn("w:tbl"):
+                items.append(("table", Table(child, document)))
+        return items
+
+    @staticmethod
+    def _docx_image_relationship_ids(container: Any) -> list[str]:
+        return [
+            relationship_id
+            for blip in container._element.xpath(".//a:blip")
+            if (relationship_id := blip.get(qn("r:embed")))
+        ]
+
+    @staticmethod
+    def _xlsx_sheet_data(
+        formula_sheet: Any, value_sheet: Any
+    ) -> tuple[list[list[str]], list[dict[str, Any]], list[str]]:
+        rows: list[list[str]] = []
+        formulas: list[dict[str, Any]] = []
+        for row_no in range(1, formula_sheet.max_row + 1):
+            row_values = []
+            for column_no in range(1, formula_sheet.max_column + 1):
+                formula_cell = formula_sheet.cell(row_no, column_no)
+                cached_value = value_sheet.cell(row_no, column_no).value
+                display_value = cached_value
+                if formula_cell.data_type == "f":
+                    formulas.append(
+                        {
+                            "coordinate": formula_cell.coordinate,
+                            "formula": formula_cell.value,
+                            "cached_value": cached_value,
+                        }
+                    )
+                elif display_value is None:
+                    display_value = formula_cell.value
+                row_values.append("" if display_value is None else str(display_value))
+            rows.append(row_values)
+        return rows, formulas, [str(item) for item in formula_sheet.merged_cells.ranges]
+
     def _source(
         self, version_id: UUID
     ) -> tuple[DocumentVersion, Document, Project, StoredFile, Path]:
@@ -194,7 +258,7 @@ class DocumentParser:
         if extension == "pdf":
             summary = self._parse_pdf(version, document, project, path, progress)
         elif extension == "docx":
-            summary = self._parse_docx(version, path, progress)
+            summary = self._parse_docx(version, project, path, progress)
         elif extension in {"txt", "md"}:
             summary = self._parse_text(version, path, progress)
         elif extension in {"xlsx", "xls"}:
@@ -600,25 +664,103 @@ class DocumentParser:
         }
 
     def _parse_docx(
-        self, version: DocumentVersion, path: Path, progress: ProgressCallback
+        self,
+        version: DocumentVersion,
+        project: Project,
+        path: Path,
+        progress: ProgressCallback,
     ) -> dict[str, Any]:
         document = DocxDocument(str(path))
-        paragraphs = [p.text.strip() for p in document.paragraphs if p.text.strip()]
-        text = "\n".join(paragraphs)
-        page_id = self._insert_page(version.id, 1, text_content=text, text_source="embedded")
-        blocks = [{"text": value, "type": "paragraph"} for value in paragraphs]
-        block_count = self._insert_blocks(version.id, page_id, blocks)
         tables_table = table(self.db, "document_tables")
         cells_table = table(self.db, "document_table_cells")
-        cell_count = 0
-        for index, docx_table in enumerate(document.tables, start=1):
+        figures_table = table(self.db, "document_figures")
+        page_id = self._insert_page(version.id, 1, text_content="", text_source="embedded")
+        blocks: list[dict[str, Any]] = []
+        cell_count = table_count = figure_count = 0
+
+        def store_images(container: Any, caption: str | None) -> None:
+            nonlocal figure_count
+            for relationship_id in self._docx_image_relationship_ids(container):
+                if relationship_id not in document.part.rels:
+                    continue
+                image_part = document.part.rels[relationship_id].target_part
+                original_name = Path(str(image_part.partname)).name
+                extension = Path(original_name).suffix.lstrip(".") or "png"
+                saved = self.storage.save_bytes(
+                    project.id,
+                    category="figures",
+                    extension=extension,
+                    content=image_part.blob,
+                    media_type=getattr(image_part, "content_type", None),
+                )
+                stored = StoredFile(
+                    organization_id=project.organization_id,
+                    project_id=project.id,
+                    storage_provider="local",
+                    storage_key=saved.storage_key,
+                    original_name=original_name,
+                    safe_name=saved.safe_name,
+                    extension=saved.extension,
+                    media_type=saved.media_type,
+                    byte_size=saved.byte_size,
+                    sha256=saved.sha256,
+                    purpose="figure",
+                    security_status="generated",
+                    metadata_json={"docx_relationship_id": relationship_id},
+                )
+                self.db.add(stored)
+                self.db.flush()
+                figure_count += 1
+                figure_no = f"docx-f{figure_count}"
+                self.db.execute(
+                    insert(figures_table).values(
+                        document_version_id=version.id,
+                        page_id=page_id,
+                        figure_no=figure_no,
+                        title=caption,
+                        caption=caption,
+                        figure_type="embedded_image",
+                        image_file_id=stored.id,
+                        axis_metadata={},
+                        legend_metadata={},
+                        extracted_labels=[],
+                        confidence=1,
+                    )
+                )
+                blocks.append(
+                    {
+                        "text": f"[Embedded image {figure_count}]",
+                        "type": "figure_reference",
+                        "payload": {"figure_no": figure_no},
+                    }
+                )
+
+        for item_type, item in self._docx_body_items(document):
+            if item_type == "paragraph":
+                paragraph = item
+                paragraph_text = paragraph.text.strip()
+                if paragraph_text:
+                    blocks.append({"text": paragraph_text, "type": "paragraph"})
+                store_images(paragraph, paragraph_text or None)
+                continue
+            docx_table = item
+            table_count += 1
             rows = [[cell.text.strip() for cell in row.cells] for row in docx_table.rows]
+            table_text = "\n".join("\t".join(row) for row in rows)
+            if table_text.strip():
+                blocks.append(
+                    {
+                        "text": table_text,
+                        "type": "table_text",
+                        "payload": {"table_no": f"docx-t{table_count}"},
+                    }
+                )
             table_id = self.db.execute(
                 insert(tables_table)
                 .values(
                     document_version_id=version.id,
                     page_id=page_id,
-                    table_no=f"docx-t{index}",
+                    table_no=f"docx-t{table_count}",
                     row_count=len(rows),
                     column_count=max((len(row) for row in rows), default=0),
                     structured_data={"rows": rows},
@@ -643,14 +785,21 @@ class DocumentParser:
             if values:
                 self.db.execute(insert(cells_table), values)
                 cell_count += len(values)
+            store_images(docx_table, table_text.strip() or None)
+        text = "\n".join(str(block["text"]) for block in blocks)
+        pages_table = table(self.db, "document_pages")
+        self.db.execute(
+            update(pages_table).where(pages_table.c.id == page_id).values(text_content=text)
+        )
+        block_count = self._insert_blocks(version.id, page_id, blocks)
         self.db.commit()
         progress(95, "parsed_docx")
         return {
             "pages": 1,
             "blocks": block_count,
-            "tables": len(document.tables),
+            "tables": table_count,
             "cells": cell_count,
-            "figures": 0,
+            "figures": figure_count,
             "requires_ocr": False,
         }
 
@@ -678,22 +827,27 @@ class DocumentParser:
     def _parse_xlsx(
         self, version: DocumentVersion, path: Path, progress: ProgressCallback
     ) -> dict[str, Any]:
-        workbook = load_workbook(path, read_only=True, data_only=True)
+        formula_workbook = load_workbook(path, read_only=False, data_only=False)
+        value_workbook = load_workbook(path, read_only=False, data_only=True)
         tables_table = table(self.db, "document_tables")
         cells_table = table(self.db, "document_table_cells")
         total_cells = 0
-        for page_no, sheet in enumerate(workbook.worksheets, start=1):
-            rows = [
-                ["" if value is None else str(value) for value in row]
-                for row in sheet.iter_rows(values_only=True)
-            ]
+        for page_no, formula_sheet in enumerate(formula_workbook.worksheets, start=1):
+            value_sheet = value_workbook[formula_sheet.title]
+            rows, formulas, merged_ranges = self._xlsx_sheet_data(
+                formula_sheet, value_sheet
+            )
             text = "\n".join("\t".join(row) for row in rows)
             page_id = self._insert_page(
                 version.id,
                 page_no,
                 text_content=text,
                 text_source="spreadsheet",
-                metadata={"sheet_name": sheet.title},
+                metadata={
+                    "sheet_name": formula_sheet.title,
+                    "merged_ranges": merged_ranges,
+                    "formula_count": len(formulas),
+                },
             )
             self._insert_blocks(version.id, page_id, [{"text": text, "type": "table_text"}])
             table_id = self.db.execute(
@@ -701,40 +855,62 @@ class DocumentParser:
                 .values(
                     document_version_id=version.id,
                     page_id=page_id,
-                    table_no=sheet.title,
-                    title=sheet.title,
+                    table_no=formula_sheet.title,
+                    title=formula_sheet.title,
                     row_count=len(rows),
                     column_count=max((len(row) for row in rows), default=0),
-                    structured_data={"rows": rows},
+                    structured_data={
+                        "rows": rows,
+                        "merged_ranges": merged_ranges,
+                        "formulas": formulas,
+                    },
                     confidence=1,
                 )
                 .returning(tables_table.c.id)
             ).scalar_one()
-            values = [
-                {
-                    "table_id": table_id,
-                    "row_index": row_no,
-                    "column_index": col_no,
-                    "cell_role": "header" if row_no == 0 else "data",
-                    "raw_text": value,
-                    "normalized_text": value,
-                    "style": {},
-                    "confidence": 1,
-                }
-                for row_no, row in enumerate(rows)
-                for col_no, value in enumerate(row)
-            ]
+            formula_by_coordinate = {item["coordinate"]: item for item in formulas}
+            values = []
+            for row_no, row in enumerate(rows):
+                for col_no, value in enumerate(row):
+                    coordinate = formula_sheet.cell(row_no + 1, col_no + 1).coordinate
+                    values.append(
+                        {
+                            "table_id": table_id,
+                            "row_index": row_no,
+                            "column_index": col_no,
+                            "cell_role": "header" if row_no == 0 else "data",
+                            "raw_text": value,
+                            "normalized_text": value,
+                            "style": {
+                                "coordinate": coordinate,
+                                "formula": formula_by_coordinate.get(coordinate),
+                                "merged_range": next(
+                                    (
+                                        str(item)
+                                        for item in formula_sheet.merged_cells.ranges
+                                        if coordinate in item
+                                    ),
+                                    None,
+                                ),
+                            },
+                            "confidence": 1,
+                        }
+                    )
             if values:
                 self.db.execute(insert(cells_table), values)
                 total_cells += len(values)
             progress(
-                5 + 90 * page_no / max(len(workbook.worksheets), 1), f"parsing_sheet_{page_no}"
+                5 + 90 * page_no / max(len(formula_workbook.worksheets), 1),
+                f"parsing_sheet_{page_no}",
             )
             self.db.commit()
+        page_count = len(formula_workbook.worksheets)
+        formula_workbook.close()
+        value_workbook.close()
         return {
-            "pages": len(workbook.worksheets),
-            "blocks": len(workbook.worksheets),
-            "tables": len(workbook.worksheets),
+            "pages": page_count,
+            "blocks": page_count,
+            "tables": page_count,
             "cells": total_cells,
             "figures": 0,
             "requires_ocr": False,

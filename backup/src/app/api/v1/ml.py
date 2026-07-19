@@ -61,6 +61,11 @@ def create_optimization(
     return service(db).create_optimization(project_id, payload, actor_id)
 
 
+@router.get("/{project_id}/optimization-runs", response_model=list[dict[str, Any]])
+def list_optimizations(project_id: UUID, db: DbSession):
+    return service(db).list_optimizations(project_id)
+
+
 @router.get("/{project_id}/optimization-runs/{run_id}", response_model=dict[str, Any])
 def get_optimization(project_id: UUID, run_id: UUID, db: DbSession):
     return service(db).get_optimization(project_id, run_id)

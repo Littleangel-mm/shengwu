@@ -119,8 +119,12 @@ class MLService:
                 task_type=payload.task_type,
                 status="queued",
                 random_seed=payload.random_seed,
-                split_strategy="group_shuffle_split",
-                group_field_key="source_document_id",
+                split_strategy=payload.split_strategy,
+                group_field_key=(
+                    "source_document_id"
+                    if payload.split_strategy == "group_shuffle_split"
+                    else None
+                ),
                 split_config={"test_size": payload.test_size, "cv_folds": payload.cv_folds},
                 preprocessing_config={
                     "numeric_imputer": payload.numeric_imputer,
@@ -175,6 +179,8 @@ class MLService:
             requested_by=actor_id,
         )
         self.db.add(job)
+        self.db.flush()
+        self.db.execute(update(runs).where(runs.c.id == run_id).values(job_id=job.id))
         self.db.commit()
         return TaskAccepted(resource_id=run_id, job_id=job.id)
 
@@ -229,6 +235,24 @@ class MLService:
             ]
         result["models"] = model_rows
         return result
+
+    def sync_run_status(self, run_id: UUID, status: str) -> None:
+        """Synchronize a training resource after the worker changes job state.
+
+        The worker must call this after its own rollback when handling a failure.
+        """
+        if status not in {"running", "completed", "failed"}:
+            raise ValueError(f"unsupported ML run status: {status}")
+        runs = table(self.db, "ml_runs")
+        if self.db.scalar(select(runs.c.id).where(runs.c.id == run_id)) is None:
+            raise AppError(code="ml_run_not_found", message="建模任务不存在", status_code=404)
+        values: dict[str, Any] = {"status": status}
+        if status == "completed":
+            values["completed_at"] = func.now()
+        elif status in {"running", "failed"}:
+            values["completed_at"] = None
+        self.db.execute(update(runs).where(runs.c.id == run_id).values(**values))
+        self.db.commit()
 
     def _matrix(
         self,
@@ -471,6 +495,7 @@ class MLService:
         run = self.db.execute(select(runs).where(runs.c.id == run_id)).mappings().one_or_none()
         if not run:
             raise AppError(code="ml_run_not_found", message="建模任务不存在", status_code=404)
+        self.sync_run_status(run_id, "running")
         field_rows = (
             self.db.execute(
                 select(run_fields)
@@ -510,16 +535,28 @@ class MLService:
                 code="insufficient_samples", message="清理无效目标值后样本不足", status_code=422
             )
         test_size = float((run["split_config"] or {}).get("test_size", 0.2))
-        unique_groups = len(set(groups))
         indices = np.arange(len(X))
-        if unique_groups >= 2:
+        if run["split_strategy"] == "group_shuffle_split":
+            unique_groups = len(set(groups))
+            if unique_groups < 2:
+                raise AppError(
+                    code="insufficient_groups",
+                    message="安全分组切分至少需要两个来源文献；如确需随机切分请显式配置",
+                    status_code=422,
+                )
             splitter = GroupShuffleSplit(
                 n_splits=1, test_size=test_size, random_state=run["random_seed"] or 42
             )
             train_idx, test_idx = next(splitter.split(X, y, groups))
-        else:
+        elif run["split_strategy"] == "random_split":
             train_idx, test_idx = train_test_split(
                 indices, test_size=test_size, random_state=run["random_seed"] or 42
+            )
+        else:
+            raise AppError(
+                code="invalid_split_strategy",
+                message="不支持的数据切分策略",
+                status_code=422,
             )
         X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
         y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
@@ -1067,8 +1104,21 @@ class MLService:
             requested_by=actor_id,
         )
         self.db.add(job)
+        self.db.flush()
+        self.db.execute(update(runs).where(runs.c.id == run_id).values(job_id=job.id))
         self.db.commit()
         return TaskAccepted(resource_id=run_id, job_id=job.id)
+
+    def list_optimizations(self, project_id: UUID) -> list[dict]:
+        runs = table(self.db, "optimization_runs")
+        return [
+            dict(row)
+            for row in self.db.execute(
+                select(runs)
+                .where(runs.c.project_id == project_id)
+                .order_by(runs.c.created_at.desc())
+            ).mappings()
+        ]
 
     def optimize(self, run_id: UUID, progress: Callable[[float, str], None]) -> dict[str, Any]:
         runs = table(self.db, "optimization_runs")

@@ -353,6 +353,98 @@ export type DatasetVersionDetail = {
   limit: number
 }
 
+export type MLMetric = {
+  id: string
+  split_name: string
+  metric_name: string
+  metric_value: number
+}
+
+export type MLExplanation = {
+  id: string
+  method: string
+  explanation_data: {
+    features?: Array<{ feature?: string; name?: string; importance?: number; value?: number }>
+  }
+}
+
+export type MLModel = GenericRecord & {
+  algorithm_code: string
+  is_selected: boolean
+  hyperparameters: Record<string, unknown>
+  metrics: MLMetric[]
+  explanations: MLExplanation[]
+}
+
+export type MLRun = GenericRecord & {
+  name: string
+  dataset_version_id: string
+  task_type: 'regression' | 'classification'
+  status: string
+  job_id?: string | null
+  metrics_summary?: Record<string, unknown>
+  created_at: string
+  models?: MLModel[]
+}
+
+export type PredictionResult = {
+  model_id: string
+  target: string
+  prediction: number | string
+  task_type: string
+  uncertainty: {
+    standard_deviation?: number
+    prediction_interval_95?: [number, number]
+    confidence?: number
+    entropy?: number
+    probabilities?: Array<number | { label: string; probability: number }>
+  }
+}
+
+export type OptimizationRun = GenericRecord & {
+  name: string
+  ml_model_id: string
+  status: string
+  job_id?: string | null
+  objective: Record<string, unknown>
+  constraints: Record<string, unknown>
+  candidates?: Array<{
+    id: string
+    rank_no: number
+    input_values: Record<string, unknown>
+    predicted_values: Record<string, unknown>
+    uncertainty: Record<string, unknown>
+    objective_score: number
+    is_feasible: boolean
+  }>
+}
+
+export type ReportItem = GenericRecord & {
+  title: string
+  dataset_version_id: string
+  ml_run_id?: string | null
+  optimization_run_id?: string | null
+  status: string
+  job_id?: string | null
+  created_at: string
+}
+
+export type MemberItem = {
+  user_id: string
+  email: string
+  display_name: string
+  role: string
+  status: string
+}
+
+export type ProjectMembership = {
+  project_id: string
+  project_role?: string | null
+  organization_role?: string | null
+  can_write: boolean
+  can_manage_members: boolean
+}
+
 export class ApiError extends Error {
   status: number
   code: string
@@ -463,6 +555,38 @@ export const api = {
     description?: string
     research_domain?: string
   }) => request<Project>('/projects', { method: 'POST', body: json(payload) }),
+  projectMembership: (projectId: string) =>
+    request<ProjectMembership>(`/projects/${projectId}/membership`),
+  projectMembers: (projectId: string) =>
+    request<MemberItem[]>(`/projects/${projectId}/members`),
+  inviteProjectMember: (projectId: string, email: string, role: string) =>
+    request<MemberItem>(`/projects/${projectId}/members`, {
+      method: 'POST',
+      body: json({ email, role }),
+    }),
+  updateProjectMember: (projectId: string, userId: string, role: string) =>
+    request<MemberItem>(`/projects/${projectId}/members/${userId}`, {
+      method: 'PATCH',
+      body: json({ role }),
+    }),
+  removeProjectMember: (projectId: string, userId: string) =>
+    request<void>(`/projects/${projectId}/members/${userId}`, { method: 'DELETE' }),
+  organizationMembers: (organizationId: string) =>
+    request<MemberItem[]>(`/organizations/${organizationId}/members`),
+  inviteOrganizationMember: (organizationId: string, email: string, role: string) =>
+    request<MemberItem>(`/organizations/${organizationId}/members`, {
+      method: 'POST',
+      body: json({ email, role }),
+    }),
+  updateOrganizationMember: (organizationId: string, userId: string, role: string) =>
+    request<MemberItem>(`/organizations/${organizationId}/members/${userId}`, {
+      method: 'PATCH',
+      body: json({ role }),
+    }),
+  removeOrganizationMember: (organizationId: string, userId: string) =>
+    request<void>(`/organizations/${organizationId}/members/${userId}`, {
+      method: 'DELETE',
+    }),
 
   documents: (projectId: string) =>
     request<ListResponse<DocumentItem>>(`/projects/${projectId}/documents?limit=100`),
@@ -722,16 +846,75 @@ export const api = {
       `${name || 'dataset'}.xlsx`,
     ),
   mlRuns: (projectId: string) =>
-    request<GenericRecord[]>(`/projects/${projectId}/ml-runs`),
+    request<MLRun[]>(`/projects/${projectId}/ml-runs`),
+  mlRun: (projectId: string, runId: string) =>
+    request<MLRun>(`/projects/${projectId}/ml-runs/${runId}`),
+  createMlRun: (
+    projectId: string,
+    payload: {
+      name: string
+      dataset_version_id: string
+      task_type: 'regression' | 'classification'
+      input_field_ids: string[]
+      target_field_id: string
+      algorithms: string[]
+      random_seed: number
+      test_size: number
+      numeric_imputer: string
+      scaler: string
+      cv_folds: number
+      parameter_search: boolean
+      explain: boolean
+      split_strategy?: string
+    },
+  ) =>
+    request<TaskAccepted>(`/projects/${projectId}/ml-runs`, {
+      method: 'POST',
+      body: json(payload),
+    }),
+  selectMlModel: (projectId: string, runId: string, modelId: string) =>
+    request<Record<string, unknown>>(
+      `/projects/${projectId}/ml-runs/${runId}/models/${modelId}/select`,
+      { method: 'POST' },
+    ),
+  predict: (projectId: string, modelId: string, values: Record<string, unknown>) =>
+    request<PredictionResult>(`/projects/${projectId}/ml-models/${modelId}/predict`, {
+      method: 'POST',
+      body: json({ values }),
+    }),
+  predictMany: (projectId: string, modelIds: string[], values: Record<string, unknown>) =>
+    request<{ predictions: PredictionResult[]; count: number }>(
+      `/projects/${projectId}/ml-models/predict-many`,
+      { method: 'POST', body: json({ model_ids: modelIds, values }) },
+    ),
+  optimizationRuns: (projectId: string) =>
+    request<OptimizationRun[]>(`/projects/${projectId}/optimization-runs`),
   optimization: (projectId: string, runId: string) =>
-    request<GenericRecord>(`/projects/${projectId}/optimization-runs/${runId}`),
+    request<OptimizationRun>(`/projects/${projectId}/optimization-runs/${runId}`),
+  createOptimization: (
+    projectId: string,
+    payload: {
+      name: string
+      ml_model_id: string
+      objective: Record<string, unknown>
+      constraints: Record<string, Record<string, unknown>>
+      sample_count: number
+      top_n: number
+      random_seed: number
+    },
+  ) =>
+    request<TaskAccepted>(`/projects/${projectId}/optimization-runs`, {
+      method: 'POST',
+      body: json(payload),
+    }),
   reports: (projectId: string) =>
-    request<GenericRecord[]>(`/projects/${projectId}/reports`),
+    request<ReportItem[]>(`/projects/${projectId}/reports`),
   createReport: (
     projectId: string,
     title: string,
     datasetVersionId: string,
     mlRunId?: string,
+    optimizationRunId?: string,
   ) =>
     request<TaskAccepted>(`/projects/${projectId}/reports`, {
       method: 'POST',
@@ -739,8 +922,11 @@ export const api = {
         title,
         dataset_version_id: datasetVersionId,
         ml_run_id: mlRunId || null,
+        optimization_run_id: optimizationRunId || null,
       }),
     }),
+  report: (projectId: string, reportId: string) =>
+    request<ReportItem>(`/projects/${projectId}/reports/${reportId}`),
   downloadReport: async (projectId: string, reportId: string, title: string) => {
     const headers = new Headers()
     const token = session.getToken()

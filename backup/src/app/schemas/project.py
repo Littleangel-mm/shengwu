@@ -1,8 +1,8 @@
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 
 class ProjectCreate(BaseModel):
@@ -39,3 +39,35 @@ class ProjectResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     archived_at: datetime | None
+
+
+ProjectRole = Literal["owner", "editor", "viewer"]
+
+
+class ProjectMemberInvite(BaseModel):
+    email: EmailStr
+    role: ProjectRole = "viewer"
+
+
+class ProjectMemberUpdate(BaseModel):
+    role: ProjectRole
+
+
+class ProjectMemberResponse(BaseModel):
+    id: UUID
+    user_id: UUID
+    email: str
+    display_name: str
+    role: ProjectRole
+    status: str
+    created_at: datetime
+
+
+class ProjectMembershipResponse(BaseModel):
+    project_id: UUID
+    user_id: UUID
+    role: ProjectRole
+    project_role: ProjectRole | None
+    organization_role: str | None
+    can_write: bool
+    can_manage_members: bool

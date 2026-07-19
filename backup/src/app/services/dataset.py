@@ -732,6 +732,7 @@ class DatasetService:
         rows = table(self.db, "dataset_rows")
         cells = table(self.db, "dataset_cells")
         evidence = table(self.db, "dataset_cell_evidence")
+        conversions = table(self.db, "conversion_records")
         next_version = (
             self.db.scalar(
                 select(func.max(versions.c.version_no)).where(
@@ -817,6 +818,16 @@ class DatasetService:
                 insert(cells).values(**values).returning(cells.c.id)
             ).scalar_one()
         if cell_map:
+            excluded_conversion = {"id", "dataset_cell_id", "created_at"}
+            for item in self.db.execute(
+                select(conversions).where(conversions.c.dataset_cell_id.in_(list(cell_map)))
+            ).mappings():
+                values = {
+                    key: value for key, value in item.items() if key not in excluded_conversion
+                }
+                values["dataset_cell_id"] = cell_map[item["dataset_cell_id"]]
+                self.db.execute(insert(conversions).values(**values))
+        if cell_map:
             excluded_evidence = {"id", "dataset_cell_id", "created_at"}
             for item in self.db.execute(
                 select(evidence).where(evidence.c.dataset_cell_id.in_(list(cell_map)))
@@ -853,6 +864,7 @@ class DatasetService:
         source_fields = table(self.db, "field_definitions")
         records = table(self.db, "extraction_records")
         evidence = table(self.db, "extraction_evidence")
+        conversions = table(self.db, "conversion_records")
         version = (
             self.db.execute(
                 select(versions, datasets.c.project_id)
@@ -972,6 +984,11 @@ class DatasetService:
                     )
                     .returning(dataset_cells.c.id)
                 ).scalar_one()
+                self.db.execute(
+                    update(conversions)
+                    .where(conversions.c.extraction_record_id == record["id"])
+                    .values(dataset_cell_id=cell_id)
+                )
                 evidence_rows = (
                     self.db.execute(
                         select(evidence).where(evidence.c.extraction_record_id == record["id"])

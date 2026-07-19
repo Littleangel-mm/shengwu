@@ -76,3 +76,34 @@ def review_extraction_record(
     return ExtractionService(db).review_record(
         project_id, run_id, record_id, payload, actor_id
     )
+
+
+@router.get(
+    "/{project_id}/extraction-runs/{run_id}/records/{record_id}/conversions",
+    response_model=list[dict[str, Any]],
+)
+def list_record_conversions(
+    project_id: UUID,
+    run_id: UUID,
+    record_id: UUID,
+    db: DbSession,
+):
+    return ExtractionService(db).list_conversions(project_id, run_id, record_id)
+
+
+@router.post(
+    "/{project_id}/extraction-runs/{run_id}/records/{record_id}/conversions/"
+    "{conversion_id}/confirm",
+    response_model=dict[str, Any],
+)
+def confirm_record_conversion(
+    project_id: UUID,
+    run_id: UUID,
+    record_id: UUID,
+    conversion_id: UUID,
+    db: DbSession,
+    actor_id: ActorId,
+):
+    return ExtractionService(db).confirm_conversion(
+        project_id, run_id, record_id, conversion_id, actor_id
+    )

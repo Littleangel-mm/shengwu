@@ -1088,6 +1088,8 @@ CREATE TABLE conversion_records (
 
 CREATE INDEX ix_conversion_records_project ON conversion_records(project_id, created_at DESC);
 CREATE INDEX ix_conversion_records_cell ON conversion_records(dataset_cell_id);
+CREATE INDEX ix_conversion_records_extraction_record
+    ON conversion_records(extraction_record_id);
 
 -- Enforce that fields/rows/cells of a frozen dataset version are immutable.
 CREATE OR REPLACE FUNCTION ensure_dataset_direct_mutable()

@@ -28,6 +28,7 @@ class MLRunCreate(BaseModel):
         max_length=10,
     )
     random_seed: int = 42
+    split_strategy: Literal["group_shuffle_split", "random_split"] = "group_shuffle_split"
     test_size: float = Field(default=0.2, gt=0.05, lt=0.5)
     numeric_imputer: Literal["median", "mean", "most_frequent"] = "median"
     scaler: Literal["standard", "minmax", "robust", "none"] = "standard"

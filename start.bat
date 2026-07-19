@@ -74,7 +74,7 @@ if not exist "models\paddleocr\PP-OCRv5_mobile_rec" echo [WARN] OCR recognition 
 call :api_running
 if errorlevel 1 (
     echo [INFO] Starting FastAPI...
-    start "Shengwu API" /D "%APP_DIR%" "%PYTHON_EXE%" -m app
+    start "Shengwu API Logs" /D "%APP_DIR%" cmd.exe /k ""%PYTHON_EXE%" -m app"
 ) else (
     echo [OK] FastAPI is already listening on port 8000.
 )
@@ -82,7 +82,7 @@ if errorlevel 1 (
 call :worker_running
 if errorlevel 1 (
     echo [INFO] Starting background worker...
-    start "Shengwu Worker" /D "%APP_DIR%" "%PYTHON_EXE%" -m app.worker
+    start "Shengwu Worker Logs" /D "%APP_DIR%" cmd.exe /k ""%PYTHON_EXE%" -m app.worker"
 ) else (
     echo [OK] Background worker is already running.
 )
@@ -97,6 +97,7 @@ if errorlevel 1 (
 )
 
 echo [OK] Shengwu backend is ready.
+echo [INFO] API and worker log windows will remain open until you close them.
 echo [INFO] API docs: http://127.0.0.1:8000/docs
 start "" "http://127.0.0.1:8000/docs"
 popd

@@ -1192,7 +1192,14 @@ function DocumentDetailSection({
       </div>
     )
 
-  const data = detail.data
+  const data = {
+    ...detail.data,
+    pages: detail.data.pages ?? [],
+    blocks: detail.data.blocks ?? [],
+    tables: detail.data.tables ?? [],
+    figures: detail.data.figures ?? [],
+    counts: detail.data.counts ?? { blocks: 0, tables: 0, figures: 0 },
+  }
   const requestedPage = Number(new URLSearchParams(location.search).get('page')) || undefined
   const selectedPage = activePage || requestedPage || data.pages[0]?.page_no
   const page = data.pages.find((item) => item.page_no === selectedPage)

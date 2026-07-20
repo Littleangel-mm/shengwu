@@ -2189,6 +2189,56 @@ function TermsSection({ projectId }: { projectId: string }) {
       ])
     },
   })
+  const [showDiscovery, setShowDiscovery] = useState(false)
+  const [discoveryScope, setDiscoveryScope] = useState('')
+  const [discoverySelected, setDiscoverySelected] = useState<Record<string, boolean>>({})
+  const [discoverySchemaName, setDiscoverySchemaName] = useState('自动发现字段方案')
+  const candidates = useQuery({
+    queryKey: ['field-candidates', projectId],
+    queryFn: () => api.fieldCandidates(projectId),
+    enabled: showDiscovery,
+  })
+  const discoverFields = useMutation({
+    mutationFn: () => api.discoverFields(projectId, { search_run_id: discoveryScope || null }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['jobs', projectId] }),
+  })
+  const selectedCandidateCount = (candidates.data || []).filter(
+    (item) => discoverySelected[item.id],
+  ).length
+  const confirmCandidates = useMutation({
+    mutationFn: () => {
+      const chosen = (candidates.data || []).filter((item) => discoverySelected[item.id])
+      const payloadCandidates = chosen.map((item, index) => {
+        const ascii = item.display_name.replace(/[^A-Za-z0-9_-]+/g, '_').replace(/^_+|_+$/g, '')
+        const role = item.suggested_role || 'feature'
+        const dataType = (item.data_type as FieldDefinition['data_type']) || 'number'
+        return {
+          term_id: item.id,
+          field_key: ascii && /^[A-Za-z0-9_-]+$/.test(ascii) ? ascii : `field_${index + 1}`,
+          display_name: item.display_name,
+          semantic_role: role,
+          data_type: dataType,
+          is_identifier: role === 'identifier',
+          include_in_model: role !== 'metadata' && role !== 'identifier',
+          include_in_score: false,
+        }
+      })
+      return api.createFieldSchemaFromCandidates(projectId, {
+        name: discoverySchemaName || '自动发现字段方案',
+        candidates: payloadCandidates,
+      })
+    },
+    onSuccess: async () => {
+      setShowDiscovery(false)
+      setDiscoverySelected({})
+      await Promise.all([
+        refreshTerms(),
+        queryClient.invalidateQueries({ queryKey: ['field-schemas', projectId] }),
+        queryClient.invalidateQueries({ queryKey: ['field-candidates', projectId] }),
+      ])
+      setTab('schemas')
+    },
+  })
   const saveSchema = useMutation({
     mutationFn: () => {
       const payload = {
@@ -2247,6 +2297,9 @@ function TermsSection({ projectId }: { projectId: string }) {
     applyTemplate.error ||
     suggestions.error ||
     mergeCluster.error ||
+    discoverFields.error ||
+    candidates.error ||
+    confirmCandidates.error ||
     saveSchema.error ||
     freezeSchema.error
 
@@ -2331,7 +2384,137 @@ function TermsSection({ projectId }: { projectId: string }) {
             >
               <GitMerge size={15} /> 同义词建议
             </button>
+            <button
+              className={`button button-primary ${showDiscovery ? 'active' : ''}`}
+              onClick={() => setShowDiscovery((value) => !value)}
+              title="从已上传文献自动发现可建模字段，无需手工配置"
+            >
+              <Sparkles size={15} /> 自动发现字段
+            </button>
           </div>
+          {showDiscovery && (
+            <section className="panel glass discovery-panel">
+              <PanelHeading
+                eyebrow="零配置字段发现"
+                title="从文献自动发现候选字段"
+              />
+              <p className="panel-note">
+                系统从已解析文献的正文、表格与图注中，自动识别"名词 + 数值 + 单位"模式、表头与高频指标，生成候选字段。数值一律回原文抽取，大模型仅辅助命名与归类，绝不编造数值。
+              </p>
+              <div className="discovery-controls">
+                <select value={discoveryScope} onChange={(event) => setDiscoveryScope(event.target.value)}>
+                  <option value="">发现范围：全部文献</option>
+                  {searches.data?.items.map((run) => (
+                    <option value={run.id} key={run.id}>
+                      仅检索命中：{run.name || run.terms.join('、')}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  className="button button-secondary"
+                  disabled={discoverFields.isPending}
+                  onClick={() => discoverFields.mutate()}
+                >
+                  {discoverFields.isPending ? <LoaderCircle className="spin" size={15} /> : <Sparkles size={15} />}
+                  开始发现
+                </button>
+                <button
+                  className="button button-secondary"
+                  onClick={() => candidates.refetch()}
+                  disabled={candidates.isFetching}
+                >
+                  <RotateCcw size={15} /> 刷新候选
+                </button>
+              </div>
+              {discoverFields.isSuccess && (
+                <p className="panel-note success">发现任务已提交，可在"任务日志"查看进度，完成后点击"刷新候选"。</p>
+              )}
+              {candidates.isLoading || candidates.isFetching ? (
+                <LoadingPane />
+              ) : candidates.data?.length ? (
+                <>
+                  <div className="discovery-select-bar">
+                    <label>
+                      <span>方案名称</span>
+                      <input
+                        value={discoverySchemaName}
+                        onChange={(event) => setDiscoverySchemaName(event.target.value)}
+                      />
+                    </label>
+                    <button
+                      className="mini-button"
+                      onClick={() =>
+                        setDiscoverySelected(
+                          Object.fromEntries((candidates.data || []).map((item) => [item.id, true])),
+                        )
+                      }
+                    >
+                      全选
+                    </button>
+                    <button className="mini-button" onClick={() => setDiscoverySelected({})}>
+                      清空
+                    </button>
+                    <button
+                      className="button button-primary"
+                      disabled={selectedCandidateCount === 0 || confirmCandidates.isPending}
+                      onClick={() => confirmCandidates.mutate()}
+                    >
+                      {confirmCandidates.isPending ? (
+                        <LoaderCircle className="spin" size={15} />
+                      ) : (
+                        <CircleCheck size={15} />
+                      )}
+                      一键确认（{selectedCandidateCount}）生成字段方案
+                    </button>
+                  </div>
+                  <div className="discovery-candidate-list">
+                    {candidates.data.map((item) => (
+                      <article
+                        key={item.id}
+                        className={discoverySelected[item.id] ? 'selected' : ''}
+                      >
+                        <header>
+                          <label>
+                            <input
+                              type="checkbox"
+                              checked={!!discoverySelected[item.id]}
+                              onChange={(event) =>
+                                setDiscoverySelected((current) => ({
+                                  ...current,
+                                  [item.id]: event.target.checked,
+                                }))
+                              }
+                            />
+                            <strong>{item.display_name}</strong>
+                          </label>
+                          <span className="candidate-tags">
+                            <span className="tag">{item.data_type}</span>
+                            {item.suggested_role && <span className="tag">{item.suggested_role}</span>}
+                            {item.category && <span className="tag">{item.category}</span>}
+                            {item.suggested_unit && <span className="tag unit">{item.suggested_unit}</span>}
+                          </span>
+                        </header>
+                        <div className="candidate-meta">
+                          <small>文档数 {item.document_count} · 出现 {item.occurrence_count} 次</small>
+                          {item.confidence != null && (
+                            <small>置信度 {Math.round(item.confidence * 100)}%</small>
+                          )}
+                          {item.aliases.length > 0 && (
+                            <small>命中写法：{item.aliases.slice(0, 5).join('、')}</small>
+                          )}
+                        </div>
+                        {item.examples.length > 0 && (
+                          <p className="candidate-example">例：{item.examples[0]}</p>
+                        )}
+                      </article>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                <EmptyInline text="暂无候选字段，先点击“开始发现”，或确认已有已解析的文献" />
+              )}
+            </section>
+          )}
           {showSuggestions && (
             <section className="panel glass synonym-panel">
               <PanelHeading

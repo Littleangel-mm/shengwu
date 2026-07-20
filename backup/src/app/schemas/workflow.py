@@ -89,6 +89,13 @@ class TermDiscoveryCreate(BaseModel):
     max_candidates: int = Field(default=500, ge=10, le=5000)
 
 
+class FieldDiscoveryCreate(BaseModel):
+    search_run_id: UUID | None = None
+    min_documents: int = Field(default=1, ge=1, le=100)
+    max_candidates: int = Field(default=200, ge=10, le=2000)
+    use_llm: bool = True
+
+
 class FieldDefinitionInput(BaseModel):
     field_key: str = Field(min_length=1, max_length=160, pattern=r"^[A-Za-z0-9_\-]+$")
     display_name: str = Field(min_length=1, max_length=240)
@@ -117,6 +124,22 @@ class FieldSchemaUpdate(BaseModel):
     name: str = Field(min_length=1, max_length=240)
     settings: dict[str, Any]
     fields: list[FieldDefinitionInput] = Field(min_length=1, max_length=500)
+
+
+class CandidateFieldInput(BaseModel):
+    term_id: UUID
+    field_key: str = Field(min_length=1, max_length=160, pattern=r"^[A-Za-z0-9_\-]+$")
+    display_name: str = Field(min_length=1, max_length=240)
+    semantic_role: str = Field(default="feature", max_length=32)
+    data_type: Literal["text", "number", "boolean", "date", "category", "range"] = "number"
+    is_identifier: bool = False
+    include_in_model: bool = True
+    include_in_score: bool = False
+
+
+class FieldSchemaFromCandidates(BaseModel):
+    name: str = Field(min_length=1, max_length=240)
+    candidates: list[CandidateFieldInput] = Field(min_length=1, max_length=500)
 
 
 class ExtractionCreate(BaseModel):

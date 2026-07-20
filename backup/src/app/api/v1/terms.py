@@ -6,7 +6,9 @@ from fastapi import APIRouter, Query
 from app.api.deps import ActorId, DbSession
 from app.schemas.common import ListResponse
 from app.schemas.workflow import (
+    FieldDiscoveryCreate,
     FieldSchemaCreate,
+    FieldSchemaFromCandidates,
     FieldSchemaUpdate,
     TaskAccepted,
     TermCategoryCreate,
@@ -119,11 +121,34 @@ def discover_terms(
     return TermService(db).enqueue_discovery(project_id, payload, actor_id)
 
 
+@router.post("/{project_id}/field-discovery", response_model=TaskAccepted, status_code=202)
+def discover_fields(
+    project_id: UUID, payload: FieldDiscoveryCreate, db: DbSession, actor_id: ActorId
+):
+    return TermService(db).enqueue_field_discovery(project_id, payload, actor_id)
+
+
+@router.get("/{project_id}/field-candidates", response_model=list[dict[str, Any]])
+def list_field_candidates(project_id: UUID, db: DbSession):
+    return TermService(db).list_field_candidates(project_id)
+
+
 @router.post("/{project_id}/field-schemas", response_model=dict[str, Any], status_code=201)
 def create_field_schema(
     project_id: UUID, payload: FieldSchemaCreate, db: DbSession, actor_id: ActorId
 ):
     return TermService(db).create_field_schema(project_id, payload, actor_id)
+
+
+@router.post(
+    "/{project_id}/field-schemas/from-candidates",
+    response_model=dict[str, Any],
+    status_code=201,
+)
+def create_field_schema_from_candidates(
+    project_id: UUID, payload: FieldSchemaFromCandidates, db: DbSession, actor_id: ActorId
+):
+    return TermService(db).create_field_schema_from_candidates(project_id, payload, actor_id)
 
 
 @router.get("/{project_id}/field-schemas", response_model=list[dict[str, Any]])

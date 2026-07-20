@@ -358,6 +358,18 @@ class JobWorker:
                 min_occurrences=int(job.requested_config.get("min_occurrences", 2)),
                 max_candidates=int(job.requested_config.get("max_candidates", 500)),
             )
+        if job.job_type == "discover_fields":
+            from app.services.term import TermService
+
+            search_run_id = job.requested_config.get("search_run_id")
+            return TermService(db).discover_fields(
+                job.project_id,
+                progress,
+                search_run_id=UUID(search_run_id) if search_run_id else None,
+                min_documents=int(job.requested_config.get("min_documents", 1)),
+                max_candidates=int(job.requested_config.get("max_candidates", 200)),
+                use_llm=bool(job.requested_config.get("use_llm", True)),
+            )
         if job.job_type == "run_extraction":
             from app.services.extraction import ExtractionService
 

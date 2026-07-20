@@ -258,6 +258,32 @@ export type FieldSchema = GenericRecord & {
   fields?: FieldDefinition[]
 }
 
+export type FieldCandidate = {
+  id: string
+  display_name: string
+  category?: string | null
+  category_id?: string | null
+  data_type: string
+  suggested_role?: string | null
+  suggested_unit?: string | null
+  occurrence_count: number
+  document_count: number
+  confidence?: number | null
+  examples: string[]
+  aliases: string[]
+}
+
+export type CandidateFieldInput = {
+  term_id: string
+  field_key: string
+  display_name: string
+  semantic_role: string
+  data_type: FieldDefinition['data_type']
+  is_identifier: boolean
+  include_in_model: boolean
+  include_in_score: boolean
+}
+
 export type ExtractionRun = GenericRecord & {
   name?: string | null
   field_schema_id: string
@@ -746,6 +772,29 @@ export const api = {
     request<TaskAccepted>(`/projects/${projectId}/term-discovery`, {
       method: 'POST',
       body: json({ search_run_id: searchRunId, min_occurrences: 2, max_candidates: 500 }),
+    }),
+  discoverFields: (
+    projectId: string,
+    options?: { search_run_id?: string | null; min_documents?: number; use_llm?: boolean },
+  ) =>
+    request<TaskAccepted>(`/projects/${projectId}/field-discovery`, {
+      method: 'POST',
+      body: json({
+        search_run_id: options?.search_run_id ?? null,
+        min_documents: options?.min_documents ?? 1,
+        max_candidates: 200,
+        use_llm: options?.use_llm ?? true,
+      }),
+    }),
+  fieldCandidates: (projectId: string) =>
+    request<FieldCandidate[]>(`/projects/${projectId}/field-candidates`),
+  createFieldSchemaFromCandidates: (
+    projectId: string,
+    payload: { name: string; candidates: CandidateFieldInput[] },
+  ) =>
+    request<FieldSchema>(`/projects/${projectId}/field-schemas/from-candidates`, {
+      method: 'POST',
+      body: json(payload),
     }),
   fieldSchemas: (projectId: string) =>
     request<FieldSchema[]>(`/projects/${projectId}/field-schemas`),

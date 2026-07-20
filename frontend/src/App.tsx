@@ -17,6 +17,7 @@ import {
   FlaskConical,
   FolderKanban,
   Gem,
+  GitBranch,
   GitMerge,
   Image,
   Layers3,
@@ -71,6 +72,8 @@ import {
   type QualityReport,
   type JobItem,
   type MLModel,
+  type PrismaExclusionReason,
+  type PrismaFlowData,
   type Project,
   type SearchMode,
   type SearchRun,
@@ -798,10 +801,21 @@ const workspaceNav = [
   { key: 'extraction', label: '数据抽取', icon: FileSearch },
   { key: 'datasets', label: '数据集', icon: Database },
   { key: 'models', label: '模型实验', icon: BrainCircuit },
+  { key: 'prisma', label: '系统综述', icon: GitBranch, requiresSetting: 'enable_prisma' },
   { key: 'reports', label: '研究报告', icon: BarChart3 },
   { key: 'members', label: '成员权限', icon: Users },
   { key: 'audit', label: '审计记录', icon: ShieldCheck },
 ]
+
+function projectHasSetting(project: Project | undefined, key: string): boolean {
+  return Boolean(project?.settings && (project.settings as Record<string, unknown>)[key])
+}
+
+function resolveWorkspaceNav(project?: Project) {
+  return workspaceNav.filter(
+    (item) => !item.requiresSetting || projectHasSetting(project, item.requiresSetting),
+  )
+}
 
 function WorkspacePage() {
   const { projectId = '', section = 'overview', documentId, datasetId, datasetVersionId } = useParams()
@@ -838,7 +852,7 @@ function WorkspacePage() {
           </span>
         </div>
         <nav className="workspace-nav">
-          {workspaceNav.map(({ key, label, icon: Icon }) => (
+          {resolveWorkspaceNav(project.data).map(({ key, label, icon: Icon }) => (
             <NavLink
               key={key}
               to={`/app/projects/${projectId}/${key}`}
@@ -902,6 +916,7 @@ function WorkspaceSection({
   if (section === 'extraction') return <ExtractionSection projectId={projectId} />
   if (section === 'datasets') return <DatasetsSection projectId={projectId} />
   if (section === 'models') return <MLSection projectId={projectId} />
+  if (section === 'prisma') return <PrismaSection projectId={projectId} />
   if (section === 'reports') return <ReportsSection projectId={projectId} />
   if (section === 'members') return <MembersSection projectId={projectId} project={project} />
   if (section === 'audit')
@@ -919,6 +934,16 @@ function WorkspaceSection({
 }
 
 function OverviewSection({ projectId, project }: { projectId: string; project?: Project }) {
+  const queryClient = useQueryClient()
+  const { canWrite } = useProjectAccess()
+  const prismaEnabled = projectHasSetting(project, 'enable_prisma')
+  const togglePrisma = useMutation({
+    mutationFn: (next: boolean) =>
+      api.updateProject(projectId, {
+        settings: { ...(project?.settings ?? {}), enable_prisma: next },
+      }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['project', projectId] }),
+  })
   const documents = useQuery({
     queryKey: ['documents', projectId],
     queryFn: () => api.documents(projectId),
@@ -988,6 +1013,27 @@ function OverviewSection({ projectId, project }: { projectId: string; project?: 
             <i />
           </div>
           <p className="muted">数据、模型和报告保留完整来源链。</p>
+        </section>
+        <section className="panel glass span-two">
+          <PanelHeading eyebrow="研究方法配置" title="系统综述 (PRISMA)" />
+          <div className="setting-toggle">
+            <div>
+              <strong>启用 PRISMA 流程模块</strong>
+              <p className="muted">
+                开启后在侧栏显示“系统综述”，可录入文献筛选各阶段计数并将 PRISMA 流程图写入研究报告。
+              </p>
+            </div>
+            <button
+              type="button"
+              className={`switch ${prismaEnabled ? 'on' : ''}`}
+              disabled={!canWrite || togglePrisma.isPending}
+              onClick={() => togglePrisma.mutate(!prismaEnabled)}
+              aria-pressed={prismaEnabled}
+            >
+              <span className="switch-knob" />
+            </button>
+          </div>
+          <ErrorNotice error={togglePrisma.error} />
         </section>
       </div>
     </div>
@@ -3802,6 +3848,212 @@ function MembersSection({ projectId, project }: { projectId: string; project?: P
           ))}</div>
         ) : <EmptyInline text="暂无成员或无权查看" />}
       </section>
+    </div>
+  )
+}
+
+const PRISMA_FIELD_LABELS: { key: keyof PrismaFlowData; label: string; stage: string }[] = [
+  { key: 'identified_databases', label: '数据库检索记录数', stage: '识别' },
+  { key: 'identified_registers', label: '注册库检索记录数', stage: '识别' },
+  { key: 'duplicates_removed', label: '去重/筛选前剔除数', stage: '去重' },
+  { key: 'records_screened', label: '筛选记录数', stage: '筛选' },
+  { key: 'records_excluded', label: '筛选排除数', stage: '筛选' },
+  { key: 'reports_sought', label: '全文获取数', stage: '全文评估' },
+  { key: 'reports_not_retrieved', label: '未获取全文数', stage: '全文评估' },
+  { key: 'reports_assessed', label: '全文评估数', stage: '全文评估' },
+  { key: 'studies_included', label: '最终纳入研究数', stage: '纳入' },
+]
+
+const EMPTY_PRISMA: PrismaFlowData = {
+  identified_databases: 0,
+  identified_registers: 0,
+  duplicates_removed: 0,
+  records_screened: 0,
+  records_excluded: 0,
+  reports_sought: 0,
+  reports_not_retrieved: 0,
+  reports_assessed: 0,
+  studies_included: 0,
+  reports_excluded: [],
+}
+
+function PrismaSection({ projectId }: { projectId: string }) {
+  const queryClient = useQueryClient()
+  const { canWrite } = useProjectAccess()
+  const [form, setForm] = useState<PrismaFlowData>(EMPTY_PRISMA)
+  const [notes, setNotes] = useState('')
+  const flow = useQuery({ queryKey: ['prisma', projectId], queryFn: () => api.prisma(projectId) })
+
+  useEffect(() => {
+    if (flow.data) {
+      setForm({ ...EMPTY_PRISMA, ...flow.data.data })
+      setNotes(flow.data.notes || '')
+    }
+  }, [flow.data])
+
+  const save = useMutation({
+    mutationFn: () => api.updatePrisma(projectId, { ...form, notes }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['prisma', projectId] }),
+  })
+
+  const setCount = (key: keyof PrismaFlowData, value: string) =>
+    setForm((prev) => ({ ...prev, [key]: Math.max(0, Number(value) || 0) }))
+
+  const updateReason = (index: number, patch: Partial<PrismaExclusionReason>) =>
+    setForm((prev) => ({
+      ...prev,
+      reports_excluded: prev.reports_excluded.map((item, i) =>
+        i === index ? { ...item, ...patch } : item,
+      ),
+    }))
+
+  return (
+    <div className="workspace-content">
+      <SectionIntro
+        eyebrow="系统综述与荟萃分析"
+        title="PRISMA 文献筛选流程"
+        description="记录文献识别、去重、筛选与纳入各阶段计数，生成 PRISMA 2020 流程图并写入研究报告。"
+      />
+      <div className="content-grid">
+        <form
+          className="panel glass span-two prisma-form"
+          onSubmit={(event) => {
+            event.preventDefault()
+            save.mutate()
+          }}
+        >
+          <PanelHeading eyebrow="流程计数" title="各阶段记录数" />
+          <div className="prisma-grid">
+            {PRISMA_FIELD_LABELS.map((field) => (
+              <label key={field.key} className="field">
+                <span>
+                  <em className="prisma-stage">{field.stage}</em> {field.label}
+                </span>
+                <input
+                  type="number"
+                  min={0}
+                  value={form[field.key] as number}
+                  disabled={!canWrite}
+                  onChange={(event) => setCount(field.key, event.target.value)}
+                />
+              </label>
+            ))}
+          </div>
+          <div className="prisma-reasons">
+            <div className="panel-heading">
+              <span>全文排除原因</span>
+              <h3>纳入前排除明细</h3>
+            </div>
+            {form.reports_excluded.map((item, index) => (
+              <div className="prisma-reason-row" key={index}>
+                <input
+                  value={item.reason}
+                  placeholder="排除原因"
+                  disabled={!canWrite}
+                  onChange={(event) => updateReason(index, { reason: event.target.value })}
+                />
+                <input
+                  type="number"
+                  min={0}
+                  value={item.count}
+                  disabled={!canWrite}
+                  onChange={(event) => updateReason(index, { count: Math.max(0, Number(event.target.value) || 0) })}
+                />
+                <button
+                  type="button"
+                  className="mini-button"
+                  disabled={!canWrite}
+                  onClick={() =>
+                    setForm((prev) => ({
+                      ...prev,
+                      reports_excluded: prev.reports_excluded.filter((_, i) => i !== index),
+                    }))
+                  }
+                >
+                  <Trash2 size={14} />
+                </button>
+              </div>
+            ))}
+            <button
+              type="button"
+              className="mini-button"
+              disabled={!canWrite}
+              onClick={() =>
+                setForm((prev) => ({
+                  ...prev,
+                  reports_excluded: [...prev.reports_excluded, { reason: '', count: 0 }],
+                }))
+              }
+            >
+              <Plus size={14} /> 添加排除原因
+            </button>
+          </div>
+          <label className="field">
+            <span>备注</span>
+            <textarea
+              rows={2}
+              value={notes}
+              disabled={!canWrite}
+              onChange={(event) => setNotes(event.target.value)}
+              placeholder="检索策略、数据库范围、检索时间等说明"
+            />
+          </label>
+          <button className="button button-primary" disabled={!canWrite || save.isPending}>
+            <Save size={14} /> 保存流程数据
+          </button>
+          <ErrorNotice error={save.error} />
+        </form>
+        <section className="panel glass prisma-diagram">
+          <PanelHeading eyebrow="PRISMA 2020" title="流程图预览" />
+          <PrismaFlowDiagram data={form} />
+        </section>
+      </div>
+    </div>
+  )
+}
+
+function PrismaFlowDiagram({ data }: { data: PrismaFlowData }) {
+  const reasonText = data.reports_excluded
+    .filter((item) => item.reason)
+    .map((item) => `${item.reason} (${item.count})`)
+    .join('；')
+  const steps: { title: string; lines: string[] }[] = [
+    {
+      title: '识别',
+      lines: [
+        `数据库检索 ${data.identified_databases} 条`,
+        `注册库检索 ${data.identified_registers} 条`,
+      ],
+    },
+    { title: '去重', lines: [`筛选前剔除 ${data.duplicates_removed} 条`] },
+    {
+      title: '筛选',
+      lines: [`筛选 ${data.records_screened} 条`, `排除 ${data.records_excluded} 条`],
+    },
+    {
+      title: '全文评估',
+      lines: [
+        `获取全文 ${data.reports_sought} 条`,
+        `未获取 ${data.reports_not_retrieved} 条`,
+        `评估 ${data.reports_assessed} 条`,
+        ...(reasonText ? [`排除原因: ${reasonText}`] : []),
+      ],
+    },
+    { title: '纳入', lines: [`最终纳入研究 ${data.studies_included} 项`] },
+  ]
+  return (
+    <div className="prisma-flow">
+      {steps.map((step, index) => (
+        <div key={step.title}>
+          <div className="prisma-node">
+            <strong>{step.title}</strong>
+            {step.lines.map((line) => (
+              <span key={line}>{line}</span>
+            ))}
+          </div>
+          {index < steps.length - 1 && <div className="prisma-arrow">↓</div>}
+        </div>
+      ))}
     </div>
   )
 }

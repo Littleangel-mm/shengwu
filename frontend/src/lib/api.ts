@@ -21,7 +21,33 @@ export type Project = {
   research_domain?: string | null
   default_language: string
   status: string
+  settings?: Record<string, unknown>
   created_at: string
+}
+
+export type PrismaExclusionReason = {
+  reason: string
+  count: number
+}
+
+export type PrismaFlowData = {
+  identified_databases: number
+  identified_registers: number
+  duplicates_removed: number
+  records_screened: number
+  records_excluded: number
+  reports_sought: number
+  reports_not_retrieved: number
+  reports_assessed: number
+  studies_included: number
+  reports_excluded: PrismaExclusionReason[]
+}
+
+export type PrismaFlow = {
+  project_id: string
+  data: PrismaFlowData
+  notes?: string | null
+  exists: boolean
 }
 
 export type TokenResponse = {
@@ -627,6 +653,10 @@ export const api = {
     description?: string
     research_domain?: string
   }) => request<Project>('/projects', { method: 'POST', body: json(payload) }),
+  updateProject: (
+    projectId: string,
+    patch: { name?: string; description?: string; settings?: Record<string, unknown> },
+  ) => request<Project>(`/projects/${projectId}`, { method: 'PATCH', body: json(patch) }),
   archiveProject: (projectId: string) =>
     request<Project>(`/projects/${projectId}/archive`, { method: 'POST' }),
   unarchiveProject: (projectId: string) =>
@@ -1074,6 +1104,16 @@ export const api = {
     anchor.click()
     URL.revokeObjectURL(blobUrl)
   },
+  prisma: (projectId: string) =>
+    request<PrismaFlow>(`/projects/${projectId}/prisma`),
+  updatePrisma: (
+    projectId: string,
+    payload: PrismaFlowData & { notes?: string | null },
+  ) =>
+    request<PrismaFlow>(`/projects/${projectId}/prisma`, {
+      method: 'PUT',
+      body: json(payload),
+    }),
   auditLogs: (projectId: string) =>
     request<ListResponse<GenericRecord>>(`/projects/${projectId}/audit-logs?limit=100`),
 }

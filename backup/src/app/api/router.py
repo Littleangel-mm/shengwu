@@ -10,6 +10,7 @@ from app.api.v1 import (
     jobs,
     ml,
     organizations,
+    prisma,
     projects,
     reports,
     search,
@@ -46,5 +47,8 @@ api_router.include_router(
 )
 api_router.include_router(
     reports.router, prefix="/projects", tags=["报告"], dependencies=project_dependencies
+)
+api_router.include_router(
+    prisma.router, prefix="/projects", tags=["PRISMA"], dependencies=project_dependencies
 )
 api_router.include_router(system.router, tags=["系统配置与审计"])

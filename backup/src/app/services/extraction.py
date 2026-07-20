@@ -236,6 +236,175 @@ class ExtractionService:
             "review_status_counts": counts,
         }
 
+    @staticmethod
+    def _quantile(sorted_values: list[float], q: float) -> float:
+        if not sorted_values:
+            return 0.0
+        if len(sorted_values) == 1:
+            return sorted_values[0]
+        position = q * (len(sorted_values) - 1)
+        low = int(position)
+        high = min(low + 1, len(sorted_values) - 1)
+        fraction = position - low
+        return sorted_values[low] + (sorted_values[high] - sorted_values[low]) * fraction
+
+    def quality_report(self, project_id: UUID, run_id: UUID) -> dict[str, Any]:
+        """质量评分引擎：分区完整度 + 合理范围 + 单位冲突 + 换算日志，产出 0-100 分。"""
+        runs = table(self.db, "extraction_runs")
+        records = table(self.db, "extraction_records")
+        fields = table(self.db, "field_definitions")
+        conversions = table(self.db, "conversion_records")
+        run = (
+            self.db.execute(
+                select(runs).where(runs.c.id == run_id, runs.c.project_id == project_id)
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if not run:
+            raise AppError(
+                code="extraction_run_not_found", message="抽取任务不存在", status_code=404
+            )
+        field_rows = [
+            dict(row)
+            for row in self.db.execute(
+                select(fields)
+                .where(fields.c.field_schema_id == run["field_schema_id"])
+                .order_by(fields.c.position)
+            ).mappings()
+        ]
+        record_rows = [
+            dict(row)
+            for row in self.db.execute(
+                select(records).where(records.c.extraction_run_id == run_id)
+            ).mappings()
+        ]
+        active_records = [
+            row for row in record_rows if row["review_status"] != "excluded"
+        ]
+        all_samples = {
+            (row["document_version_id"], row["group_key"]) for row in active_records
+        }
+        total_samples = len(all_samples)
+        by_field: dict[UUID, list[dict[str, Any]]] = {}
+        for row in active_records:
+            by_field.setdefault(row["field_definition_id"], []).append(row)
+
+        field_reports: list[dict[str, Any]] = []
+        completeness_scores: list[float] = []
+        range_scores: list[float] = []
+        conflict_fields = 0
+        for field in field_rows:
+            rows = by_field.get(field["id"], [])
+            samples_with_value = {
+                (row["document_version_id"], row["group_key"])
+                for row in rows
+                if row["numeric_value"] is not None or row["raw_value"]
+            }
+            completeness = (
+                len(samples_with_value) / total_samples if total_samples else 0.0
+            )
+            numeric_values = [
+                float(row["numeric_value"])
+                for row in rows
+                if row["numeric_value"] is not None
+            ]
+            validation = field.get("validation_rules") or {}
+            expected_min = validation.get("min", validation.get("minimum"))
+            expected_max = validation.get("max", validation.get("maximum"))
+            in_range = 0
+            bound_min = expected_min
+            bound_max = expected_max
+            range_source = "none"
+            if numeric_values:
+                if expected_min is not None or expected_max is not None:
+                    range_source = "rule"
+                    for value in numeric_values:
+                        ok = True
+                        if expected_min is not None and value < float(expected_min):
+                            ok = False
+                        if expected_max is not None and value > float(expected_max):
+                            ok = False
+                        in_range += int(ok)
+                elif len(numeric_values) >= 4:
+                    range_source = "data_driven_iqr"
+                    ordered = sorted(numeric_values)
+                    q1 = self._quantile(ordered, 0.25)
+                    q3 = self._quantile(ordered, 0.75)
+                    iqr = q3 - q1
+                    bound_min = q1 - 1.5 * iqr
+                    bound_max = q3 + 1.5 * iqr
+                    in_range = sum(
+                        1 for value in numeric_values if bound_min <= value <= bound_max
+                    )
+                else:
+                    in_range = len(numeric_values)
+            range_validity = (
+                in_range / len(numeric_values) if numeric_values else 1.0
+            )
+            units_seen = {
+                re.sub(r"\s+", "", str(row["raw_unit_text"]).lower())
+                for row in rows
+                if row["raw_unit_text"]
+            }
+            has_conflict = len(units_seen) > 1
+            if has_conflict:
+                conflict_fields += 1
+            completeness_scores.append(completeness)
+            if numeric_values:
+                range_scores.append(range_validity)
+            field_reports.append(
+                {
+                    "field_key": field["field_key"],
+                    "display_name": field["display_name"],
+                    "data_type": field["data_type"],
+                    "value_count": len(rows),
+                    "numeric_count": len(numeric_values),
+                    "samples_with_value": len(samples_with_value),
+                    "completeness": round(completeness, 4),
+                    "range_validity": round(range_validity, 4),
+                    "range_source": range_source,
+                    "expected_min": bound_min,
+                    "expected_max": bound_max,
+                    "out_of_range_count": len(numeric_values) - in_range,
+                    "units_seen": sorted(units_seen),
+                    "unit_conflict": has_conflict,
+                }
+            )
+
+        conversion_counts: dict[str, int] = {}
+        for conv_row in self.db.execute(
+            select(conversions.c.status, func.count().label("total"))
+            .join(records, records.c.id == conversions.c.extraction_record_id)
+            .where(records.c.extraction_run_id == run_id)
+            .group_by(conversions.c.status)
+        ).mappings():
+            conversion_counts[conv_row["status"]] = int(conv_row["total"])
+
+        avg_completeness = (
+            sum(completeness_scores) / len(completeness_scores)
+            if completeness_scores
+            else 0.0
+        )
+        avg_range = sum(range_scores) / len(range_scores) if range_scores else 1.0
+        conflict_ratio = conflict_fields / len(field_rows) if field_rows else 0.0
+        overall_score = round(
+            (0.5 * avg_completeness + 0.4 * avg_range + 0.1 * (1 - conflict_ratio)) * 100,
+            1,
+        )
+        return {
+            "extraction_run_id": run_id,
+            "status": run["status"],
+            "overall_score": overall_score,
+            "total_samples": total_samples,
+            "field_count": len(field_rows),
+            "completeness_avg": round(avg_completeness, 4),
+            "range_validity_avg": round(avg_range, 4),
+            "unit_conflict_fields": conflict_fields,
+            "conversion_counts": conversion_counts,
+            "fields": field_reports,
+        }
+
     def review_record(
         self,
         project_id: UUID,
@@ -386,6 +555,32 @@ class ExtractionService:
                 select(conversions).where(conversions.c.id == conversion_id)
             ).mappings().one()
         )
+
+    @staticmethod
+    def _evaluate_range(
+        validation_rules: dict[str, Any] | None, numeric: float | None
+    ) -> dict[str, Any]:
+        """按字段 validation_rules 的 min/max 做值域校验，超范围的疑似误撞。"""
+        rules = validation_rules or {}
+        expected_min = rules.get("min")
+        if expected_min is None:
+            expected_min = rules.get("minimum")
+        expected_max = rules.get("max")
+        if expected_max is None:
+            expected_max = rules.get("maximum")
+        has_rule = expected_min is not None or expected_max is not None
+        in_range = True
+        if has_rule and numeric is not None:
+            if expected_min is not None and numeric < float(expected_min):
+                in_range = False
+            if expected_max is not None and numeric > float(expected_max):
+                in_range = False
+        return {
+            "has_rule": has_rule,
+            "in_range": in_range,
+            "expected_min": expected_min,
+            "expected_max": expected_max,
+        }
 
     @staticmethod
     def _dimension_keys(text_value: str, fallback: str) -> tuple[str, str | None]:
@@ -788,6 +983,21 @@ class ExtractionService:
                                 if status == "applied":
                                     normalized_value = target_value
                                     normalized_unit_id = preferred_unit_id
+                    range_check = self._evaluate_range(
+                        field.get("validation_rules"), numeric
+                    )
+                    record_confidence = context["confidence"]
+                    record_review_status = "pending"
+                    quality_meta: dict[str, Any] = {
+                        "range_checked": range_check["has_rule"],
+                        "in_range": range_check["in_range"],
+                    }
+                    if range_check["has_rule"] and not range_check["in_range"]:
+                        record_confidence = round(float(record_confidence) * 0.4, 4)
+                        record_review_status = "doubtful"
+                        quality_meta["range_violation"] = True
+                        quality_meta["expected_min"] = range_check["expected_min"]
+                        quality_meta["expected_max"] = range_check["expected_max"]
                     record_id = self.db.execute(
                         insert(records)
                         .values(
@@ -813,8 +1023,8 @@ class ExtractionService:
                                 significance_match.group(1) if significance_match else None
                             ),
                             extraction_method=context["method"],
-                            confidence=context["confidence"],
-                            review_status="pending",
+                            confidence=record_confidence,
+                            review_status=record_review_status,
                             is_image_estimate=context["is_image_estimate"],
                             is_missing=False,
                             metadata={
@@ -822,6 +1032,7 @@ class ExtractionService:
                                 "treatment_time_linked": True,
                                 "source_type": context["evidence_type"],
                                 "dimensions": dimensions,
+                                "quality": quality_meta,
                             },
                         )
                         .returning(records.c.id)

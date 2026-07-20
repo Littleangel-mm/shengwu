@@ -65,6 +65,49 @@ def test_extraction_review_and_summary_routes_are_registered() -> None:
     ) in routes
 
 
+def test_evaluate_range_flags_out_of_bounds_value() -> None:
+    result = ExtractionService._evaluate_range({"min": 0, "max": 14}, 45.0)
+    assert result["has_rule"] is True
+    assert result["in_range"] is False
+    assert result["expected_max"] == 14
+
+
+def test_evaluate_range_accepts_in_bounds_value() -> None:
+    result = ExtractionService._evaluate_range({"min": 0, "max": 14}, 6.5)
+    assert result["has_rule"] is True
+    assert result["in_range"] is True
+
+
+def test_evaluate_range_without_rules_is_permissive() -> None:
+    result = ExtractionService._evaluate_range({}, 999.0)
+    assert result["has_rule"] is False
+    assert result["in_range"] is True
+
+
+def test_evaluate_range_supports_minimum_maximum_aliases() -> None:
+    result = ExtractionService._evaluate_range({"minimum": 10, "maximum": 20}, 25.0)
+    assert result["in_range"] is False
+
+
+def test_quantile_interpolates_between_points() -> None:
+    values = [1.0, 2.0, 3.0, 4.0]
+    assert ExtractionService._quantile(values, 0.25) == pytest.approx(1.75)
+    assert ExtractionService._quantile(values, 0.75) == pytest.approx(3.25)
+
+
+def test_quality_report_route_is_registered() -> None:
+    routes = {
+        (route.path, method)
+        for route in router.routes
+        if isinstance(route, APIRoute)
+        for method in route.methods
+    }
+    assert (
+        "/{project_id}/extraction-runs/{run_id}/quality-report",
+        "GET",
+    ) in routes
+
+
 def test_dimension_metadata_keeps_legacy_keys_and_conditions() -> None:
     text = "treatment: control at 24 h, 37°C, pH 6.5 and 180 rpm"
     group_key, timepoint = ExtractionService._dimension_keys(text, "block=1")

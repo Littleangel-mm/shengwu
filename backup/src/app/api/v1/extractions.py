@@ -37,6 +37,14 @@ def get_extraction_summary(project_id: UUID, run_id: UUID, db: DbSession):
 
 
 @router.get(
+    "/{project_id}/extraction-runs/{run_id}/quality-report",
+    response_model=dict[str, Any],
+)
+def get_extraction_quality_report(project_id: UUID, run_id: UUID, db: DbSession):
+    return ExtractionService(db).quality_report(project_id, run_id)
+
+
+@router.get(
     "/{project_id}/extraction-runs/{run_id}/records", response_model=ListResponse[dict[str, Any]]
 )
 def list_extraction_records(

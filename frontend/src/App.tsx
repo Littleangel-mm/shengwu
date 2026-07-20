@@ -68,6 +68,7 @@ import {
   type FieldDefinition,
   type FieldSchema,
   type ExtractionRecord,
+  type QualityReport,
   type JobItem,
   type MLModel,
   type Project,
@@ -2804,6 +2805,87 @@ function RecordsPanel({
   )
 }
 
+function QualityReportPanel({
+  report,
+  loading,
+  error,
+}: {
+  report?: QualityReport
+  loading: boolean
+  error: unknown
+}) {
+  if (loading) return <LoadingPane />
+  if (error) return <ErrorNotice error={error} />
+  if (!report) return <EmptyInline text="暂无质量报告，运行完成后可生成" />
+  const scoreTone = report.overall_score >= 80 ? 'good' : report.overall_score >= 60 ? 'warn' : 'bad'
+  const percent = (value: number) => `${Math.round(value * 100)}%`
+  return (
+    <section className="quality-panel glass">
+      <div className="quality-overview">
+        <div className={`quality-score ${scoreTone}`}>
+          <strong>{report.overall_score}</strong>
+          <small>综合质量分</small>
+        </div>
+        <div className="quality-metrics">
+          <div><span>样本分区</span><strong>{report.total_samples}</strong></div>
+          <div><span>字段数</span><strong>{report.field_count}</strong></div>
+          <div><span>平均完整度</span><strong>{percent(report.completeness_avg)}</strong></div>
+          <div><span>平均合理范围</span><strong>{percent(report.range_validity_avg)}</strong></div>
+          <div><span>单位冲突字段</span><strong>{report.unit_conflict_fields}</strong></div>
+        </div>
+      </div>
+      {Object.keys(report.conversion_counts).length > 0 && (
+        <p className="panel-note">
+          单位换算：
+          {Object.entries(report.conversion_counts)
+            .map(([status, count]) => `${status} ${count}`)
+            .join(' · ')}
+        </p>
+      )}
+      <div className="quality-field-table">
+        <div className="quality-field-row head">
+          <span>字段</span>
+          <span>完整度</span>
+          <span>合理范围</span>
+          <span>超范围</span>
+          <span>单位</span>
+        </div>
+        {report.fields.map((field) => (
+          <div className="quality-field-row" key={field.field_key}>
+            <span className="quality-field-name">
+              {field.display_name}
+              {field.unit_conflict && <em className="quality-flag">单位冲突</em>}
+            </span>
+            <span>
+              <QualityBar value={field.completeness} />
+              {percent(field.completeness)}
+            </span>
+            <span>
+              <QualityBar value={field.range_validity} />
+              {field.numeric_count ? percent(field.range_validity) : '—'}
+            </span>
+            <span className={field.out_of_range_count > 0 ? 'quality-flag' : ''}>
+              {field.numeric_count ? field.out_of_range_count : '—'}
+              {field.range_source === 'data_driven_iqr' && field.numeric_count ? ' (IQR)' : ''}
+            </span>
+            <span className="quality-units">{field.units_seen.join('、') || '—'}</span>
+          </div>
+        ))}
+      </div>
+    </section>
+  )
+}
+
+function QualityBar({ value }: { value: number }) {
+  const clamped = Math.max(0, Math.min(1, value))
+  const tone = clamped >= 0.8 ? 'good' : clamped >= 0.5 ? 'warn' : 'bad'
+  return (
+    <span className="quality-bar">
+      <span className={`quality-bar-fill ${tone}`} style={{ width: `${clamped * 100}%` }} />
+    </span>
+  )
+}
+
 function ExtractionSection({ projectId }: { projectId: string }) {
   const queryClient = useQueryClient()
   const [schemaId, setSchemaId] = useState('')
@@ -2842,6 +2924,12 @@ function ExtractionSection({ projectId }: { projectId: string }) {
     queryKey: ['extraction-summary', projectId, selectedRunId],
     queryFn: () => api.extractionSummary(projectId, selectedRunId),
     enabled: Boolean(selectedRunId),
+  })
+  const [showQuality, setShowQuality] = useState(false)
+  const quality = useQuery({
+    queryKey: ['extraction-quality', projectId, selectedRunId],
+    queryFn: () => api.extractionQualityReport(projectId, selectedRunId),
+    enabled: Boolean(selectedRunId) && showQuality,
   })
   const create = useMutation({
     mutationFn: () => api.createExtraction(projectId, schemaId, searchRunId || undefined),
@@ -2956,8 +3044,19 @@ function ExtractionSection({ projectId }: { projectId: string }) {
                 <option value="doubtful">标疑</option>
                 <option value="excluded">已排除</option>
               </select>
+              <button
+                type="button"
+                className={`button button-secondary ${showQuality ? 'active' : ''}`}
+                disabled={!selectedRunId}
+                onClick={() => setShowQuality((value) => !value)}
+              >
+                <ShieldCheck size={15} /> 质量报告
+              </button>
             </div>
           </div>
+          {showQuality && selectedRunId && (
+            <QualityReportPanel report={quality.data} loading={quality.isLoading || quality.isFetching} error={quality.error} />
+          )}
           <ErrorNotice error={records.error || review.error} />
           {records.isLoading ? <LoadingPane /> : allRecords.length ? (
             <div className="extraction-records">

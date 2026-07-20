@@ -3385,6 +3385,145 @@ select option {
   line-height: 1.5;
 }
 
+.quality-panel {
+  padding: 18px;
+  margin-bottom: 16px;
+  display: grid;
+  gap: 14px;
+}
+
+.quality-overview {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 20px;
+  align-items: center;
+}
+
+.quality-score {
+  display: grid;
+  justify-items: center;
+  padding: 14px 22px;
+  border-radius: 16px;
+  border: 1px solid var(--line);
+  min-width: 120px;
+}
+
+.quality-score strong {
+  font-size: 34px;
+  line-height: 1;
+}
+
+.quality-score small {
+  color: var(--muted);
+  font-size: 11px;
+  margin-top: 6px;
+}
+
+.quality-score.good {
+  border-color: rgba(90, 190, 130, 0.5);
+  color: #6fdc9b;
+}
+
+.quality-score.warn {
+  border-color: rgba(200, 169, 107, 0.55);
+  color: var(--gold);
+}
+
+.quality-score.bad {
+  border-color: rgba(224, 108, 108, 0.55);
+  color: #f08a8a;
+}
+
+.quality-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 22px;
+}
+
+.quality-metrics div {
+  display: grid;
+  gap: 4px;
+}
+
+.quality-metrics span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.quality-metrics strong {
+  font-size: 18px;
+}
+
+.quality-field-table {
+  display: grid;
+  gap: 2px;
+  font-size: 12px;
+}
+
+.quality-field-row {
+  display: grid;
+  grid-template-columns: 1.6fr 1.4fr 1.4fr 0.8fr 1fr;
+  gap: 12px;
+  align-items: center;
+  padding: 8px 10px;
+  border-radius: 8px;
+}
+
+.quality-field-row.head {
+  color: var(--muted);
+  font-size: 11px;
+  border-bottom: 1px solid var(--line);
+}
+
+.quality-field-row:not(.head):nth-child(even) {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.quality-field-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.quality-flag {
+  color: #f08a8a;
+  font-style: normal;
+  font-size: 10px;
+}
+
+.quality-units {
+  color: var(--text-soft);
+}
+
+.quality-bar {
+  display: inline-block;
+  width: 60px;
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  margin-right: 8px;
+  vertical-align: middle;
+  overflow: hidden;
+}
+
+.quality-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+}
+
+.quality-bar-fill.good {
+  background: #5abe82;
+}
+
+.quality-bar-fill.warn {
+  background: var(--gold);
+}
+
+.quality-bar-fill.bad {
+  background: #e06c6c;
+}
+
 .page-image-stage {
   position: relative;
   overflow: hidden;

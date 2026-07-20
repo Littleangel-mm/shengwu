@@ -284,6 +284,36 @@ export type CandidateFieldInput = {
   include_in_score: boolean
 }
 
+export type QualityFieldReport = {
+  field_key: string
+  display_name: string
+  data_type: string
+  value_count: number
+  numeric_count: number
+  samples_with_value: number
+  completeness: number
+  range_validity: number
+  range_source: string
+  expected_min?: number | null
+  expected_max?: number | null
+  out_of_range_count: number
+  units_seen: string[]
+  unit_conflict: boolean
+}
+
+export type QualityReport = {
+  extraction_run_id: string
+  status: string
+  overall_score: number
+  total_samples: number
+  field_count: number
+  completeness_avg: number
+  range_validity_avg: number
+  unit_conflict_fields: number
+  conversion_counts: Record<string, number>
+  fields: QualityFieldReport[]
+}
+
 export type ExtractionRun = GenericRecord & {
   name?: string | null
   field_schema_id: string
@@ -853,6 +883,10 @@ export const api = {
       document_count: number
       review_status_counts: Record<string, number>
     }>(`/projects/${projectId}/extraction-runs/${runId}/summary`),
+  extractionQualityReport: (projectId: string, runId: string) =>
+    request<QualityReport>(
+      `/projects/${projectId}/extraction-runs/${runId}/quality-report`,
+    ),
   reviewExtractionRecord: (
     projectId: string,
     runId: string,

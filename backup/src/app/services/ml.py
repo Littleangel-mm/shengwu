@@ -150,6 +150,7 @@ class MLService:
                     "test_size": payload.test_size,
                     "cv_folds": payload.cv_folds,
                     "cv_strategy": payload.cv_strategy,
+                    "min_samples": payload.min_samples,
                 },
                 preprocessing_config={
                     "numeric_imputer": payload.numeric_imputer,
@@ -854,10 +855,11 @@ class MLService:
             X = self._compute_derived_features(X, derived_specs)
             for spec in derived_specs:
                 input_types[spec["key"]] = "number"
-        if len(X) < 4:
+        min_samples = max(4, int((run["split_config"] or {}).get("min_samples", 8)))
+        if len(X) < min_samples:
             raise AppError(
                 code="insufficient_samples",
-                message="有效样本少于 4 条，无法训练和评估",
+                message=f"有效样本少于 {min_samples} 条，无法训练和评估",
                 status_code=422,
             )
         label_encoder: LabelEncoder | None = None
@@ -874,7 +876,7 @@ class MLService:
             y_single = pd.Series(
                 label_encoder.fit_transform(Y[target_keys[0]].astype(str)), index=Y.index
             )
-        if len(X) < 4:
+        if len(X) < min_samples:
             raise AppError(
                 code="insufficient_samples", message="清理无效目标值后样本不足", status_code=422
             )
@@ -951,13 +953,26 @@ class MLService:
         cv_warnings: list[str] = []
 
         self.db.execute(delete(models_table).where(models_table.c.ml_run_id == run_id))
+        self.db.commit()
         algorithms = config.get("algorithms", ["ridge", "random_forest"])
         input_keys = list(X.columns)
+        numeric_types = {"number", "integer", "float", "decimal"}
+        training_ranges: dict[str, dict[str, float]] = {}
+        for key in raw_input_keys:
+            if input_types.get(key) in numeric_types:
+                column = pd.to_numeric(X[key].iloc[train_idx], errors="coerce")
+                if column.notna().any():
+                    training_ranges[key] = {
+                        "min": float(column.min()),
+                        "max": float(column.max()),
+                    }
         best_model_id = None
         best_score = float("inf") if run["task_type"] == "regression" else float("-inf")
         summaries = []
+        failed_models: list[dict[str, Any]] = []
         for index, code in enumerate(algorithms, start=1):
             if code == "mlp" and len(X_train) < 20:
+                failed_models.append({"algorithm": code, "reason": "样本不足以训练神经网络（<20）"})
                 continue
             estimator = (
                 self._regressor(code, run["random_seed"] or 42)
@@ -965,6 +980,9 @@ class MLService:
                 else self._classifier(code, run["random_seed"] or 42)
             )
             if estimator is None:
+                failed_models.append(
+                    {"algorithm": code, "reason": "算法不可用（可能缺少可选依赖，如 LightGBM）"}
+                )
                 continue
             preprocessor = self._preprocessor(input_types, config)
             pipeline = Pipeline([("preprocessor", preprocessor), ("model", estimator)])
@@ -979,36 +997,41 @@ class MLService:
             )
             if cv_warning and cv_warning not in cv_warnings:
                 cv_warnings.append(cv_warning)
-            if config.get("parameter_search", True) and len(X_train) >= 4:
-                scoring = (
-                    "neg_root_mean_squared_error"
-                    if run["task_type"] == "regression"
-                    else "f1_weighted"
-                )
-                search = GridSearchCV(
-                    pipeline,
-                    self._parameter_grid(code),
-                    scoring=scoring,
-                    cv=cv,
-                    n_jobs=-1,
-                    error_score="raise",
-                )
-                if fit_groups is None:
-                    search.fit(X_train, y_train)
-                else:
-                    search.fit(X_train, y_train, groups=fit_groups)
-                pipeline = search.best_estimator_
-                cv_metric = (
-                    "cv_rmse" if run["task_type"] == "regression" else "cv_f1",
-                    float(
-                        -search.best_score_
+            try:
+                if config.get("parameter_search", True) and len(X_train) >= 4:
+                    scoring = (
+                        "neg_root_mean_squared_error"
                         if run["task_type"] == "regression"
-                        else search.best_score_
-                    ),
-                )
-            else:
-                pipeline.fit(X_train, y_train)
-            predicted = np.asarray(pipeline.predict(X_test)).reshape(-1)
+                        else "f1_weighted"
+                    )
+                    search = GridSearchCV(
+                        pipeline,
+                        self._parameter_grid(code),
+                        scoring=scoring,
+                        cv=cv,
+                        n_jobs=-1,
+                        error_score="raise",
+                    )
+                    if fit_groups is None:
+                        search.fit(X_train, y_train)
+                    else:
+                        search.fit(X_train, y_train, groups=fit_groups)
+                    pipeline = search.best_estimator_
+                    cv_metric = (
+                        "cv_rmse" if run["task_type"] == "regression" else "cv_f1",
+                        float(
+                            -search.best_score_
+                            if run["task_type"] == "regression"
+                            else search.best_score_
+                        ),
+                    )
+                else:
+                    pipeline.fit(X_train, y_train)
+                predicted = np.asarray(pipeline.predict(X_test)).reshape(-1)
+            except Exception as exc:  # noqa: BLE001 单模型失败隔离：不拖垮整轮训练
+                self.db.rollback()
+                failed_models.append({"algorithm": code, "reason": str(exc)[:300]})
+                continue
             if run["task_type"] == "regression":
                 metric_values = {
                     "r2": float(r2_score(y_test, predicted)) if len(y_test) > 1 else 0.0,
@@ -1039,6 +1062,7 @@ class MLService:
                 "target_classes": label_encoder.classes_.tolist() if label_encoder else None,
                 "raw_input_keys": raw_input_keys,
                 "derived_features": derived_specs,
+                "training_ranges": training_ranges,
                 "is_composite_objective": is_multi_objective,
                 "objectives": objective_stats,
                 "residual_std": (
@@ -1230,76 +1254,90 @@ class MLService:
                             )
                         ],
                     )
+            explained_ok = False
             if config.get("explain", True):
-                scoring = (
-                    "neg_root_mean_squared_error"
-                    if run["task_type"] == "regression"
-                    else "f1_weighted"
-                )
-                importance = permutation_importance(
-                    pipeline,
-                    X_test,
-                    y_test,
-                    scoring=scoring,
-                    n_repeats=5,
-                    random_state=run["random_seed"] or 42,
-                )
-                self.db.execute(
-                    insert(explanations_table).values(
-                        ml_model_id=model_id,
-                        method="permutation_importance",
-                        scope="global",
-                        explanation_data={
-                            "features": [
-                                {
-                                    "name": key,
-                                    "importance_mean": float(importance.importances_mean[position]),
-                                    "importance_std": float(importance.importances_std[position]),
-                                }
-                                for position, key in enumerate(input_keys)
-                            ],
-                            "scoring": scoring,
-                            "sample_count": len(X_test),
-                        },
+                try:
+                    scoring = (
+                        "neg_root_mean_squared_error"
+                        if run["task_type"] == "regression"
+                        else "f1_weighted"
                     )
-                )
-                transformed_train = pipeline.named_steps["preprocessor"].transform(X_train)
-                transformed_test = pipeline.named_steps["preprocessor"].transform(X_test)
-                feature_names = list(pipeline.named_steps["preprocessor"].get_feature_names_out())
-                background = np.asarray(transformed_train)[: min(30, len(transformed_train))]
-                explained = np.asarray(transformed_test)[: min(30, len(transformed_test))]
-                fitted_model = pipeline.named_steps["model"]
-                predictor = (
-                    fitted_model.predict_proba
-                    if run["task_type"] == "classification"
-                    and hasattr(fitted_model, "predict_proba")
-                    else fitted_model.predict
-                )
-                import shap
+                    importance = permutation_importance(
+                        pipeline,
+                        X_test,
+                        y_test,
+                        scoring=scoring,
+                        n_repeats=5,
+                        random_state=run["random_seed"] or 42,
+                    )
+                    self.db.execute(
+                        insert(explanations_table).values(
+                            ml_model_id=model_id,
+                            method="permutation_importance",
+                            scope="global",
+                            explanation_data={
+                                "features": [
+                                    {
+                                        "name": key,
+                                        "importance_mean": float(
+                                            importance.importances_mean[position]
+                                        ),
+                                        "importance_std": float(
+                                            importance.importances_std[position]
+                                        ),
+                                    }
+                                    for position, key in enumerate(input_keys)
+                                ],
+                                "scoring": scoring,
+                                "sample_count": len(X_test),
+                            },
+                        )
+                    )
+                    transformed_train = pipeline.named_steps["preprocessor"].transform(X_train)
+                    transformed_test = pipeline.named_steps["preprocessor"].transform(X_test)
+                    feature_names = list(
+                        pipeline.named_steps["preprocessor"].get_feature_names_out()
+                    )
+                    background = np.asarray(transformed_train)[: min(30, len(transformed_train))]
+                    explained = np.asarray(transformed_test)[: min(30, len(transformed_test))]
+                    fitted_model = pipeline.named_steps["model"]
+                    predictor = (
+                        fitted_model.predict_proba
+                        if run["task_type"] == "classification"
+                        and hasattr(fitted_model, "predict_proba")
+                        else fitted_model.predict
+                    )
+                    import shap
 
-                explainer = shap.Explainer(
-                    predictor, background, feature_names=feature_names, algorithm="permutation"
-                )
-                shap_values = np.asarray(
-                    explainer(explained, max_evals=max(2 * len(feature_names) + 1, 11)).values
-                )
-                reduce_axes = (0,) + tuple(range(2, shap_values.ndim))
-                mean_absolute = np.mean(np.abs(shap_values), axis=reduce_axes)
-                self.db.execute(
-                    insert(explanations_table).values(
-                        ml_model_id=model_id,
-                        method="shap",
-                        scope="global",
-                        explanation_data={
-                            "features": [
-                                {"name": name, "mean_absolute_shap": float(mean_absolute[position])}
-                                for position, name in enumerate(feature_names)
-                            ],
-                            "sample_count": len(explained),
-                            "background_count": len(background),
-                        },
+                    explainer = shap.Explainer(
+                        predictor, background, feature_names=feature_names, algorithm="permutation"
                     )
-                )
+                    shap_values = np.asarray(
+                        explainer(explained, max_evals=max(2 * len(feature_names) + 1, 11)).values
+                    )
+                    reduce_axes = (0,) + tuple(range(2, shap_values.ndim))
+                    mean_absolute = np.mean(np.abs(shap_values), axis=reduce_axes)
+                    self.db.execute(
+                        insert(explanations_table).values(
+                            ml_model_id=model_id,
+                            method="shap",
+                            scope="global",
+                            explanation_data={
+                                "features": [
+                                    {
+                                        "name": name,
+                                        "mean_absolute_shap": float(mean_absolute[position]),
+                                    }
+                                    for position, name in enumerate(feature_names)
+                                ],
+                                "sample_count": len(explained),
+                                "background_count": len(background),
+                            },
+                        )
+                    )
+                    explained_ok = True
+                except Exception as exc:  # noqa: BLE001 可解释性失败不影响已持久化的模型
+                    cv_warnings.append(f"{code} 可解释性计算失败：{str(exc)[:200]}")
             summaries.append(
                 {
                     "model_id": str(model_id),
@@ -1307,7 +1345,7 @@ class MLService:
                     "metrics": metric_values,
                     "cross_validation": {cv_metric[0]: cv_metric[1]} if cv_metric else None,
                     "cv_folds": fold_summary,
-                    "explained": bool(config.get("explain", True)),
+                    "explained": explained_ok,
                 }
             )
             if better:
@@ -1315,8 +1353,13 @@ class MLService:
             progress(10 + 80 * index / max(len(algorithms), 1), f"training_{code}")
             self.db.commit()
         if not best_model_id:
+            reasons = "；".join(
+                f"{item['algorithm']}: {item['reason']}" for item in failed_models
+            )
             raise AppError(
-                code="no_supported_models", message="没有可执行的模型算法", status_code=422
+                code="no_supported_models",
+                message=f"没有可成功训练的模型{('（' + reasons + '）') if reasons else ''}",
+                status_code=422,
             )
         self.db.execute(
             update(models_table)
@@ -1333,6 +1376,7 @@ class MLService:
             "test_samples": len(test_idx),
             "cv_strategy": cv_strategy,
             "cv_warnings": cv_warnings,
+            "failed_models": failed_models,
             "is_composite_objective": is_multi_objective,
             "objectives": objective_stats,
             "target_key": target_key,

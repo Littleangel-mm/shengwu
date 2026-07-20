@@ -111,6 +111,23 @@ def test_resolve_cv_degrades_explicitly_when_groups_insufficient() -> None:
     assert warning is not None
 
 
+def test_min_samples_defaults_to_eight() -> None:
+    payload = MLRunCreate(
+        name="floor",
+        dataset_version_id="00000000-0000-0000-0000-000000000001",
+        input_field_ids=["00000000-0000-0000-0000-000000000002"],
+        target_field_id="00000000-0000-0000-0000-000000000003",
+    )
+    assert payload.min_samples == 8
+
+
+def test_optional_lightgbm_returns_none_when_absent() -> None:
+    import importlib.util
+
+    if importlib.util.find_spec("lightgbm") is None:
+        assert MLService._regressor("lightgbm", 42) is None
+
+
 def test_target_specs_default_to_single_target() -> None:
     payload = MLRunCreate(
         name="single",

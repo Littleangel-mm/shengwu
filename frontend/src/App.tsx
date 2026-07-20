@@ -3394,6 +3394,10 @@ function MLSection({ projectId }: { projectId: string }) {
   const [multiObjective, setMultiObjective] = useState(false)
   const [objectives, setObjectives] = useState<{ field_id: string; direction: 'maximize' | 'minimize'; weight: number }[]>([])
   const [derivedKeys, setDerivedKeys] = useState<string[]>([])
+  const [randomSeed, setRandomSeed] = useState(42)
+  const [testSize, setTestSize] = useState(0.2)
+  const [cvFolds, setCvFolds] = useState(5)
+  const [minSamples, setMinSamples] = useState(8)
   const [selectedRunId, setSelectedRunId] = useState('')
   const [predictionValues, setPredictionValues] = useState('{}')
   const [predictionResult, setPredictionResult] = useState<unknown>(null)
@@ -3456,11 +3460,12 @@ function MLSection({ projectId }: { projectId: string }) {
           : { target_field_id: targetField }),
         derived_features: (derivedCandidates.data || []).filter((item) => derivedKeys.includes(item.key)),
         algorithms,
-        random_seed: 42,
-        test_size: 0.2,
+        random_seed: randomSeed,
+        test_size: testSize,
         numeric_imputer: 'median',
         scaler: 'standard',
-        cv_folds: 5,
+        cv_folds: cvFolds,
+        min_samples: minSamples,
         parameter_search: true,
         explain: true,
         split_strategy: 'group_shuffle_split',
@@ -3597,6 +3602,10 @@ function MLSection({ projectId }: { projectId: string }) {
             <option value="leave_one_group_out">留一组（LeaveOneGroupOut）</option>
             <option value="kfold">普通 K 折（KFold）</option>
           </select></label>
+          <label><span>随机种子</span><input type="number" value={randomSeed} onChange={(event) => setRandomSeed(Number(event.target.value))} /></label>
+          <label><span>测试集比例</span><input type="number" min={0.1} max={0.45} step={0.05} value={testSize} onChange={(event) => setTestSize(Number(event.target.value))} /></label>
+          <label><span>CV 折数</span><input type="number" min={2} max={10} step={1} value={cvFolds} onChange={(event) => setCvFolds(Number(event.target.value))} /></label>
+          <label><span>最小样本量</span><input type="number" min={4} step={1} value={minSamples} onChange={(event) => setMinSamples(Number(event.target.value))} /></label>
         </div>
         {taskType === 'regression' && Boolean(derivedCandidates.data?.length) && <div className="derived-editor">
           <div className="objective-hint">派生特征（比值/乘积等）从原始输入实时计算，训练与预测一致、无需写公式，勾选即加入建模。</div>

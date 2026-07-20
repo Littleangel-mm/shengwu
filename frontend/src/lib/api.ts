@@ -985,6 +985,7 @@ export const api = {
       numeric_imputer: string
       scaler: string
       cv_folds: number
+      min_samples?: number
       parameter_search: boolean
       explain: boolean
       split_strategy?: string

@@ -119,6 +119,7 @@ class MLRunCreate(BaseModel):
     numeric_imputer: Literal["median", "mean", "most_frequent"] = "median"
     scaler: Literal["standard", "minmax", "robust", "none"] = "standard"
     cv_folds: int = Field(default=5, ge=2, le=10)
+    min_samples: int = Field(default=8, ge=4, le=100000)
     parameter_search: bool = True
     explain: bool = True
     augmentation_enabled: bool = False

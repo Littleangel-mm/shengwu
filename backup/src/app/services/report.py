@@ -1,11 +1,12 @@
 import hashlib
 import io
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 from uuid import UUID
 
 import pandas as pd
 from docx import Document as WordDocument
+from docx.oxml.ns import qn
 from docx.shared import Inches, Pt
 from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.orm import Session
@@ -15,6 +16,7 @@ from app.db.tables import table
 from app.models import ProcessingJob, Project, StoredFile
 from app.schemas.report import ReportCreate
 from app.schemas.workflow import TaskAccepted
+from app.services.prisma import PRISMA_LABELS, PrismaService
 from app.services.storage import LocalStorage
 
 
@@ -186,6 +188,86 @@ class ReportService:
         document.add_heading(title, level=2)
         document.add_picture(buffer, width=Inches(6.2))
 
+    @staticmethod
+    def _apply_chinese_font(document: Any) -> None:
+        """确保正文与各级标题使用中文字体，避免 Word 中文回退为方块。"""
+        for style_name in ("Normal", "Title", "Heading 1", "Heading 2", "Heading 3"):
+            try:
+                style = document.styles[style_name]
+            except KeyError:
+                continue
+            style.font.name = "Microsoft YaHei"
+            rpr = style.element.get_or_add_rPr()
+            rfonts = rpr.get_or_add_rFonts()
+            rfonts.set(qn("w:eastAsia"), "Microsoft YaHei")
+            rfonts.set(qn("w:ascii"), "Microsoft YaHei")
+            rfonts.set(qn("w:hAnsi"), "Microsoft YaHei")
+
+    @staticmethod
+    def _placeholder(document: Any, text: str) -> None:
+        """缺步骤/缺数据时写入中性占位说明，保证章节完整且不崩溃。"""
+        paragraph = document.add_paragraph()
+        run = paragraph.add_run(text)
+        run.italic = True
+
+    @staticmethod
+    def _software_environment() -> Sequence[tuple[str, str]]:
+        from importlib import metadata
+
+        packages = [
+            ("Python", "runtime"),
+            ("scikit-learn", "sklearn"),
+            ("pandas", "pandas"),
+            ("numpy", "numpy"),
+            ("scipy", "scipy"),
+            ("matplotlib", "matplotlib"),
+            ("python-docx", "docx"),
+            ("lightgbm", "lightgbm"),
+        ]
+        import platform
+
+        rows: list[tuple[str, str]] = []
+        for label, dist in packages:
+            if dist == "runtime":
+                rows.append((label, platform.python_version()))
+                continue
+            try:
+                rows.append((label, metadata.version(dist)))
+            except metadata.PackageNotFoundError:
+                continue
+        return rows
+
+    def _add_flow_diagram(self, document: Any, steps: Sequence[str]) -> None:
+        plt = self._pyplot()
+
+        figure, axis = plt.subplots(figsize=(7.2, max(2.0, 0.9 * len(steps))))
+        axis.set_xlim(0, 10)
+        axis.set_ylim(0, len(steps))
+        axis.axis("off")
+        centers: list[float] = []
+        for index, step in enumerate(reversed(steps)):
+            y = index + 0.5
+            centers.append(y)
+            axis.add_patch(
+                plt.Rectangle(
+                    (2, y - 0.32),
+                    6,
+                    0.64,
+                    facecolor="#f5efe1",
+                    edgecolor="#8a6d3b",
+                    linewidth=1.1,
+                )
+            )
+            axis.text(5, y, step, ha="center", va="center", fontsize=10)
+        for index in range(len(centers) - 1):
+            axis.annotate(
+                "",
+                xy=(5, centers[index] - 0.32),
+                xytext=(5, centers[index + 1] + 0.32),
+                arrowprops={"arrowstyle": "-|>", "color": "#8a6d3b", "lw": 1.1},
+            )
+        self._add_chart(document, figure, "研究流程")
+
     def generate(self, report_id: UUID, progress: Callable[[float, str], None]) -> dict[str, Any]:
         reports = table(self.db, "reports")
         datasets = table(self.db, "datasets")
@@ -234,8 +316,8 @@ class ReportService:
         )
         document = WordDocument()
         styles = document.styles
-        styles["Normal"].font.name = "Microsoft YaHei"
         styles["Normal"].font.size = Pt(10.5)
+        self._apply_chinese_font(document)
         document.add_heading(report["title"], level=0)
         document.add_paragraph(f"项目：{project.name}")
         document.add_paragraph(f"数据集：{dataset['name']}，版本 V{version['version_no']}")
@@ -243,7 +325,89 @@ class ReportService:
             f"数据规模：{version['row_count']} 行，{version['field_count']} 个字段"
         )
         document.add_paragraph(f"数据校验哈希：{version['content_sha256'] or '草稿版本，尚未冻结'}")
-        progress(25, "writing_dataset_section")
+        progress(20, "writing_summary_section")
+
+        includes_model = bool(report["ml_run_id"])
+        includes_optimization = bool(report["optimization_run_id"])
+        document.add_heading("摘要", level=1)
+        document.add_paragraph(
+            f"本报告基于项目「{project.name}」的冻结数据集 V{version['version_no']}"
+            f"（{version['row_count']} 行、{version['field_count']} 个字段）编制，"
+            "所有数值均可回溯至原始文献证据。"
+            + ("报告包含机器学习建模结果。" if includes_model else "报告未包含机器学习建模结果。")
+            + ("并给出目标参数优化推荐与验证方案。" if includes_optimization else "")
+        )
+
+        document.add_heading("研究目标", level=1)
+        if project.description:
+            document.add_paragraph(str(project.description))
+        else:
+            self._placeholder(
+                document, "项目未填写研究目标描述，可在项目设置中补充后重新生成报告。"
+            )
+        objectives_config = (report["configuration"] or {}).get("objectives")
+        if isinstance(objectives_config, list) and objectives_config:
+            for objective in objectives_config:
+                document.add_paragraph(str(objective), style="List Bullet")
+
+        document.add_heading("研究流程", level=1)
+        document.add_paragraph(
+            "平台采用统一的可追溯流程：文献上传后自动发现候选字段与关键词，经人工确认后"
+            "抽取结构化数据，构建可冻结的数据集版本，训练与评估模型，进行目标参数优化推荐，"
+            "并最终生成带证据索引的研究报告。"
+        )
+        flow_steps = ["文献上传", "字段/关键词自动发现", "人工确认", "结构化抽取", "数据集冻结"]
+        if includes_model:
+            flow_steps.append("模型训练与评估")
+        if includes_optimization:
+            flow_steps.append("目标参数优化推荐")
+        flow_steps.append("研究报告生成")
+        self._add_flow_diagram(document, flow_steps)
+
+        if bool((project.settings or {}).get("enable_prisma")):
+            document.add_heading("文献筛选流程（PRISMA 2020）", level=1)
+            flow = PrismaService(self.db).get_flow(project.id)
+            prisma_data = flow["data"]
+            if flow.get("exists"):
+                prisma_table = document.add_table(rows=1, cols=2)
+                prisma_table.rows[0].cells[0].text = "阶段"
+                prisma_table.rows[0].cells[1].text = "数量"
+                for key, label in PRISMA_LABELS.items():
+                    cells_doc = prisma_table.add_row().cells
+                    cells_doc[0].text = label
+                    cells_doc[1].text = str(prisma_data.get(key, 0))
+                reasons = prisma_data.get("reports_excluded") or []
+                if reasons:
+                    document.add_paragraph("全文排除原因：")
+                    for reason in reasons:
+                        document.add_paragraph(
+                            f"{reason['reason']}：{reason['count']} 篇", style="List Bullet"
+                        )
+                if flow.get("notes"):
+                    document.add_paragraph(f"检索说明：{flow['notes']}")
+                try:
+                    import io as _io
+
+                    png = PrismaService.render_diagram(prisma_data)
+                    document.add_picture(_io.BytesIO(png), width=Inches(4.6))
+                    self.db.execute(
+                        insert(report_assets).values(
+                            report_id=report_id,
+                            asset_type="chart",
+                            section_key="prisma_flow",
+                            title="PRISMA 流程图",
+                            data_payload=prisma_data,
+                            position=5,
+                        )
+                    )
+                except Exception:  # noqa: BLE001 - 图渲染失败不应阻断报告
+                    self._placeholder(document, "PRISMA 流程图渲染失败，已跳过图示，计数见上表。")
+            else:
+                self._placeholder(
+                    document,
+                    "已启用 PRISMA 模块，但尚未录入筛选计数，可在“系统综述”页填写后重新生成。",
+                )
+        progress(28, "writing_dataset_section")
 
         document.add_heading("数据处理与可追溯性", level=1)
         document.add_paragraph(
@@ -359,9 +523,6 @@ class ReportService:
             )
             if run:
                 document.add_heading("机器学习模型", level=1)
-                document.add_paragraph(
-                    f"任务类型：{run['task_type']}；切分策略：{run['split_strategy']}；随机种子：{run['random_seed']}"
-                )
                 model_rows = (
                     self.db.execute(
                         select(ml_models)
@@ -371,6 +532,24 @@ class ReportService:
                     .mappings()
                     .all()
                 )
+                document.add_heading("建模设计", level=2)
+                document.add_paragraph(
+                    f"任务类型：{run['task_type']}；切分策略：{run['split_strategy']}；随机种子：{run['random_seed']}"
+                )
+                algorithms = sorted(
+                    {
+                        str(model.get("algorithm") or model.get("display_name"))
+                        for model in model_rows
+                    }
+                )
+                if algorithms:
+                    document.add_paragraph("候选算法：" + "、".join(algorithms))
+                document.add_paragraph(
+                    "为避免数据泄漏，特征标准化仅在训练折内拟合并应用于验证/测试；"
+                    "多目标建模时对各目标做训练集内归一化后加权合成；"
+                    "交叉验证按可用分组信息自动选择策略，退化时在训练摘要中标注。"
+                )
+                document.add_heading("模型对比", level=2)
                 table_doc = document.add_table(rows=1, cols=4)
                 for index, title in enumerate(["模型", "状态", "是否选中", "测试指标"]):
                     table_doc.rows[0].cells[index].text = title
@@ -394,6 +573,9 @@ class ReportService:
                         for item in metric_rows
                         if item["metric_value"] is not None
                     )
+                    if model["status"] != "completed" or not model["is_selected"]:
+                        # 仅展开“用户选中且训练成功”的模型明细，失败/未选模型只在对比表体现。
+                        continue
                     explanation_rows = (
                         self.db.execute(
                             select(ml_explanations).where(
@@ -421,11 +603,48 @@ class ReportService:
                                 "mean_absolute_shap", feature.get("importance_mean", 0)
                             )
                             document.add_paragraph(f"{feature.get('name')}: {score:.6g}")
+                completed_models = [m for m in model_rows if m["status"] == "completed"]
                 selected_model = next(
-                    (model for model in model_rows if model["is_selected"]),
-                    model_rows[0] if model_rows else None,
+                    (m for m in completed_models if m["is_selected"]),
+                    completed_models[0] if completed_models else None,
                 )
+                if not selected_model:
+                    self._placeholder(
+                        document,
+                        "本次运行没有训练成功的模型，故未生成模型图表；请检查数据规模或算法配置后重试。",
+                    )
                 if selected_model:
+                    document.add_heading("模型结果与公式", level=2)
+                    document.add_paragraph(
+                        f"入选模型：{selected_model['display_name']}"
+                        f"（算法：{selected_model.get('algorithm') or '未标注'}）。"
+                    )
+                    selected_metrics = (
+                        self.db.execute(
+                            select(ml_metrics).where(
+                                ml_metrics.c.ml_model_id == selected_model["id"],
+                                ml_metrics.c.split_name == "test",
+                            )
+                        )
+                        .mappings()
+                        .all()
+                    )
+                    if selected_metrics:
+                        document.add_paragraph(
+                            "测试集指标："
+                            + "，".join(
+                                f"{item['metric_name']}={item['metric_value']:.4f}"
+                                for item in selected_metrics
+                                if item["metric_value"] is not None
+                            )
+                        )
+                    else:
+                        self._placeholder(document, "入选模型暂无测试集指标记录。")
+                    document.add_paragraph(
+                        "模型采用 scikit-learn 标准实现，其解析形式由所选算法决定"
+                        "（如线性/岭回归为特征线性加权，树/集成模型为分段常数的加权组合），"
+                        "特征贡献以特征重要性图与上文数值列表呈现，不以人工设定的经验公式替代。"
+                    )
                     prediction_rows = self.db.execute(
                         select(
                             ml_predictions.c.actual_value,
@@ -556,6 +775,25 @@ class ReportService:
                     document.add_paragraph(
                         f"#{item['rank_no']} 输入={item['input_values']}，预测={item['predicted_values']}，目标分数={item['objective_score']}"
                     )
+                summary = optimization["result_summary"] or {}
+                document.add_heading("验证实验方案", level=1)
+                validation_plan = summary.get("validation_plan") or {}
+                control = validation_plan.get("control")
+                recommendations = validation_plan.get("recommendations") or []
+                if control or recommendations:
+                    if control:
+                        document.add_paragraph(f"对照组基线：{control}")
+                    document.add_paragraph("建议验证的推荐条件（按排名）：")
+                    for index, group in enumerate(recommendations[:10], start=1):
+                        document.add_paragraph(f"实验 {index}：{group}", style="List Bullet")
+                    document.add_paragraph(
+                        "建议每个条件设置重复实验，并在真实环境复测；超出训练数据适用域的候选需谨慎解读。"
+                    )
+                else:
+                    self._placeholder(
+                        document,
+                        "本次优化未生成结构化验证方案，请依据上表推荐条件设计对照与重复实验。",
+                    )
         document.add_heading("单位转换记录", level=1)
         conversion_rows = self.db.execute(
             select(
@@ -620,6 +858,41 @@ class ReportService:
         document.add_heading("局限性", level=1)
         document.add_paragraph(
             "模型输出是基于已审核文献数据的统计预测，不替代真实实验和专业判断。超出训练数据范围的候选条件应重新验证。"
+        )
+
+        document.add_heading("可复现性", level=1)
+        document.add_paragraph(
+            f"数据集版本：V{version['version_no']}；"
+            f"内容校验哈希：{version['content_sha256'] or '草稿版本，尚未冻结'}。"
+        )
+        if report["ml_run_id"]:
+            document.add_paragraph(
+                "建模随机种子、切分与交叉验证策略见“建模设计”章节；"
+                "在相同数据版本与随机种子下可复现建模结果。"
+            )
+        document.add_paragraph(
+            "所有正式数值均保留原始值、标准值、建模值三层，并关联文献页码与证据文本，"
+            "可据此复核与复现数据来源。"
+        )
+
+        document.add_heading("开源软件与方法", level=1)
+        software_rows = self._software_environment()
+        if software_rows:
+            software_table = document.add_table(rows=1, cols=2)
+            software_table.rows[0].cells[0].text = "软件/库"
+            software_table.rows[0].cells[1].text = "版本"
+            for name, version_text in software_rows:
+                cells_doc = software_table.add_row().cells
+                cells_doc[0].text = name
+                cells_doc[1].text = version_text
+        else:
+            self._placeholder(document, "未能获取软件版本信息。")
+
+        document.add_heading("发表建议", level=1)
+        document.add_paragraph(
+            "撰写论文时，建议在方法部分引用上述软件与版本，并按 PRISMA 报告文献筛选流程；"
+            "在结果部分呈现模型评估指标、特征重要性与优化推荐，并附本报告的数据版本哈希以支持复现；"
+            "在讨论部分说明适用域与局限性，对关键推荐条件给出实验验证计划。"
         )
         progress(80, "saving_report")
 

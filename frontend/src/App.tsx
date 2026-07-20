@@ -3390,6 +3390,7 @@ function MLSection({ projectId }: { projectId: string }) {
   const [inputFields, setInputFields] = useState<string[]>([])
   const [targetField, setTargetField] = useState('')
   const [algorithms, setAlgorithms] = useState<string[]>(['ridge', 'random_forest'])
+  const [cvStrategy, setCvStrategy] = useState<'group_kfold' | 'leave_one_group_out' | 'kfold'>('group_kfold')
   const [selectedRunId, setSelectedRunId] = useState('')
   const [predictionValues, setPredictionValues] = useState('{}')
   const [predictionResult, setPredictionResult] = useState<unknown>(null)
@@ -3452,6 +3453,7 @@ function MLSection({ projectId }: { projectId: string }) {
         parameter_search: true,
         explain: true,
         split_strategy: 'group_shuffle_split',
+        cv_strategy: cvStrategy,
       }),
     onSuccess: async (accepted) => {
       setSelectedRunId(accepted.resource_id)
@@ -3496,8 +3498,24 @@ function MLSection({ projectId }: { projectId: string }) {
   })
   const availableAlgorithms =
     taskType === 'regression'
-      ? ['ridge', 'pls', 'svr', 'random_forest', 'gradient_boosting', 'xgboost', 'mlp']
-      : ['logistic', 'svc', 'random_forest', 'gradient_boosting', 'xgboost', 'mlp']
+      ? [
+          'ridge', 'lasso', 'elastic_net', 'pls', 'svr', 'knn', 'decision_tree',
+          'random_forest', 'extra_trees', 'gradient_boosting', 'hist_gradient_boosting',
+          'adaboost', 'bagging', 'xgboost', 'lightgbm', 'mlp',
+        ]
+      : [
+          'logistic', 'svc', 'knn', 'decision_tree', 'random_forest', 'extra_trees',
+          'gradient_boosting', 'hist_gradient_boosting', 'adaboost', 'bagging',
+          'xgboost', 'lightgbm', 'mlp',
+        ]
+  const algorithmLabels: Record<string, string> = {
+    ridge: 'Ridge 岭回归', lasso: 'Lasso', elastic_net: 'ElasticNet', pls: 'PLS 偏最小二乘',
+    svr: 'SVR 支持向量', knn: 'KNN 近邻', decision_tree: '决策树',
+    random_forest: '随机森林', extra_trees: '极端随机树', gradient_boosting: '梯度提升',
+    hist_gradient_boosting: '直方图梯度提升', adaboost: 'AdaBoost', bagging: 'Bagging',
+    xgboost: 'XGBoost', lightgbm: 'LightGBM（需安装）', mlp: 'MLP 神经网络',
+    logistic: '逻辑回归', svc: 'SVC 支持向量',
+  }
   const models = run.data?.models || []
   const selectedModel = models.find((model) => model.is_selected) || models[0]
   const trainingJob = jobs.data?.items.find(
@@ -3538,8 +3556,15 @@ function MLSection({ projectId }: { projectId: string }) {
           <div><span>算法</span>{availableAlgorithms.map((algorithm) =>
             <label key={algorithm}><input type="checkbox" checked={algorithms.includes(algorithm)} onChange={() => setAlgorithms((current) =>
               current.includes(algorithm) ? current.filter((item) => item !== algorithm) : [...current, algorithm]
-            )} /> {algorithm}</label>
+            )} /> {algorithmLabels[algorithm] || algorithm}</label>
           )}</div>
+        </div>
+        <div className="form-grid">
+          <label><span>交叉验证策略</span><select value={cvStrategy} onChange={(event) => setCvStrategy(event.target.value as typeof cvStrategy)}>
+            <option value="group_kfold">分组 K 折（GroupKFold，按来源文献防泄漏）</option>
+            <option value="leave_one_group_out">留一组（LeaveOneGroupOut）</option>
+            <option value="kfold">普通 K 折（KFold）</option>
+          </select></label>
         </div>
         <div className="editor-actions">
           <button className="button button-primary" disabled={!canWrite || !runName || !datasetVersionId || !targetField || !inputFields.length || !algorithms.length || createRun.isPending} onClick={() => createRun.mutate()}>

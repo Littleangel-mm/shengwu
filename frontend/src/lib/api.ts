@@ -982,6 +982,7 @@ export const api = {
       parameter_search: boolean
       explain: boolean
       split_strategy?: string
+      cv_strategy?: string
     },
   ) =>
     request<TaskAccepted>(`/projects/${projectId}/ml-runs`, {

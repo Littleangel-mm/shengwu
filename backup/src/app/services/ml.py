@@ -17,14 +17,22 @@ import sklearn
 from sklearn.compose import ColumnTransformer
 from sklearn.cross_decomposition import PLSRegression
 from sklearn.ensemble import (
+    AdaBoostClassifier,
+    AdaBoostRegressor,
+    BaggingClassifier,
+    BaggingRegressor,
+    ExtraTreesClassifier,
+    ExtraTreesRegressor,
     GradientBoostingClassifier,
     GradientBoostingRegressor,
+    HistGradientBoostingClassifier,
+    HistGradientBoostingRegressor,
     RandomForestClassifier,
     RandomForestRegressor,
 )
 from sklearn.impute import SimpleImputer
 from sklearn.inspection import permutation_importance
-from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.linear_model import ElasticNet, Lasso, LogisticRegression, Ridge
 from sklearn.metrics import (
     accuracy_score,
     f1_score,
@@ -39,8 +47,10 @@ from sklearn.model_selection import (
     GroupKFold,
     GroupShuffleSplit,
     KFold,
+    LeaveOneGroupOut,
     train_test_split,
 )
+from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 from sklearn.neural_network import MLPClassifier, MLPRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import (
@@ -51,6 +61,7 @@ from sklearn.preprocessing import (
     StandardScaler,
 )
 from sklearn.svm import SVC, SVR
+from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
 from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.orm import Session
 
@@ -125,7 +136,11 @@ class MLService:
                     if payload.split_strategy == "group_shuffle_split"
                     else None
                 ),
-                split_config={"test_size": payload.test_size, "cv_folds": payload.cv_folds},
+                split_config={
+                    "test_size": payload.test_size,
+                    "cv_folds": payload.cv_folds,
+                    "cv_strategy": payload.cv_strategy,
+                },
                 preprocessing_config={
                     "numeric_imputer": payload.numeric_imputer,
                     "scaler": payload.scaler,
@@ -320,17 +335,40 @@ class MLService:
         return frame[input_keys], frame[target_key], kept_rows, groups, target_key, input_types
 
     @staticmethod
+    def _optional_lightgbm(kind: str, seed: int):
+        try:
+            import lightgbm  # noqa: F401
+            from lightgbm import LGBMClassifier, LGBMRegressor
+        except ImportError:
+            return None
+        if kind == "regression":
+            return LGBMRegressor(n_estimators=300, learning_rate=0.05, random_state=seed, n_jobs=-1)
+        return LGBMClassifier(n_estimators=300, learning_rate=0.05, random_state=seed, n_jobs=-1)
+
+    @staticmethod
     def _regressor(code: str, seed: int):
         from xgboost import XGBRegressor
 
         models = {
             "ridge": Ridge(alpha=1.0),
+            "lasso": Lasso(alpha=0.01, max_iter=5000, random_state=seed),
+            "elastic_net": ElasticNet(
+                alpha=0.01, l1_ratio=0.5, max_iter=5000, random_state=seed
+            ),
             "pls": PLSRegression(n_components=2, scale=False),
             "svr": SVR(kernel="rbf", C=10, epsilon=0.1),
+            "knn": KNeighborsRegressor(n_neighbors=5),
+            "decision_tree": DecisionTreeRegressor(random_state=seed),
             "random_forest": RandomForestRegressor(
                 n_estimators=300, random_state=seed, n_jobs=-1, min_samples_leaf=1
             ),
+            "extra_trees": ExtraTreesRegressor(
+                n_estimators=300, random_state=seed, n_jobs=-1
+            ),
             "gradient_boosting": GradientBoostingRegressor(random_state=seed),
+            "hist_gradient_boosting": HistGradientBoostingRegressor(random_state=seed),
+            "adaboost": AdaBoostRegressor(n_estimators=200, random_state=seed),
+            "bagging": BaggingRegressor(n_estimators=100, random_state=seed, n_jobs=-1),
             "xgboost": XGBRegressor(
                 n_estimators=300,
                 max_depth=6,
@@ -347,6 +385,8 @@ class MLService:
                 random_state=seed,
             ),
         }
+        if code == "lightgbm":
+            return MLService._optional_lightgbm("regression", seed)
         return models.get(code)
 
     @staticmethod
@@ -356,8 +396,16 @@ class MLService:
         models = {
             "logistic": LogisticRegression(max_iter=2000, random_state=seed),
             "svc": SVC(kernel="rbf", C=10, probability=True, random_state=seed),
+            "knn": KNeighborsClassifier(n_neighbors=5),
+            "decision_tree": DecisionTreeClassifier(random_state=seed),
             "random_forest": RandomForestClassifier(n_estimators=300, random_state=seed, n_jobs=-1),
+            "extra_trees": ExtraTreesClassifier(
+                n_estimators=300, random_state=seed, n_jobs=-1
+            ),
             "gradient_boosting": GradientBoostingClassifier(random_state=seed),
+            "hist_gradient_boosting": HistGradientBoostingClassifier(random_state=seed),
+            "adaboost": AdaBoostClassifier(n_estimators=200, random_state=seed),
+            "bagging": BaggingClassifier(n_estimators=100, random_state=seed, n_jobs=-1),
             "xgboost": XGBClassifier(
                 n_estimators=300,
                 max_depth=6,
@@ -374,6 +422,8 @@ class MLService:
                 random_state=seed,
             ),
         }
+        if code == "lightgbm":
+            return MLService._optional_lightgbm("classification", seed)
         return models.get(code)
 
     @staticmethod
@@ -427,16 +477,31 @@ class MLService:
     def _parameter_grid(code: str) -> dict[str, list[Any]]:
         grids: dict[str, dict[str, list[Any]]] = {
             "ridge": {"model__alpha": [0.1, 1.0, 10.0]},
+            "lasso": {"model__alpha": [0.001, 0.01, 0.1]},
+            "elastic_net": {
+                "model__alpha": [0.001, 0.01, 0.1],
+                "model__l1_ratio": [0.2, 0.5, 0.8],
+            },
             "pls": {"model__n_components": [1]},
             "svr": {"model__C": [1.0, 10.0], "model__epsilon": [0.05, 0.1]},
+            "knn": {"model__n_neighbors": [3, 5, 7]},
+            "decision_tree": {"model__max_depth": [None, 5, 10]},
             "logistic": {"model__C": [0.1, 1.0, 10.0]},
             "svc": {"model__C": [1.0, 10.0]},
             "random_forest": {"model__max_depth": [None, 8], "model__min_samples_leaf": [1, 2]},
+            "extra_trees": {"model__max_depth": [None, 8], "model__min_samples_leaf": [1, 2]},
             "gradient_boosting": {
                 "model__learning_rate": [0.05, 0.1],
                 "model__n_estimators": [100, 200],
             },
+            "hist_gradient_boosting": {
+                "model__learning_rate": [0.05, 0.1],
+                "model__max_iter": [100, 200],
+            },
+            "adaboost": {"model__learning_rate": [0.5, 1.0], "model__n_estimators": [100, 200]},
+            "bagging": {"model__n_estimators": [50, 100]},
             "xgboost": {"model__max_depth": [3, 6], "model__learning_rate": [0.05, 0.1]},
+            "lightgbm": {"model__num_leaves": [15, 31], "model__learning_rate": [0.05, 0.1]},
             "mlp": {"model__alpha": [0.0001, 0.001]},
         }
         return grids.get(code, {})
@@ -474,6 +539,79 @@ class MLService:
             [*groups, *augmented_groups],
             count,
         )
+
+    @staticmethod
+    def _resolve_cv(
+        strategy: str,
+        requested_folds: int,
+        groups: list[str],
+        n_samples: int,
+        seed: int,
+    ) -> tuple[Any, list[str] | None, int, str | None]:
+        """选择交叉验证策略；分组不足时显式降级（非静默），并回传告警文案。"""
+        unique_groups = len(set(groups))
+        warning: str | None = None
+        if strategy in ("group_kfold", "leave_one_group_out"):
+            if unique_groups < 2:
+                warning = (
+                    f"仅有 {unique_groups} 个分组，无法按分组做交叉验证，已显式降级为 KFold"
+                )
+                folds = max(2, min(requested_folds, n_samples))
+                return (
+                    KFold(n_splits=folds, shuffle=True, random_state=seed),
+                    None,
+                    folds,
+                    warning,
+                )
+            if strategy == "leave_one_group_out":
+                return LeaveOneGroupOut(), groups, unique_groups, warning
+            folds = max(2, min(requested_folds, unique_groups))
+            return GroupKFold(n_splits=folds), groups, folds, warning
+        folds = max(2, min(requested_folds, n_samples))
+        return KFold(n_splits=folds, shuffle=True, random_state=seed), None, folds, warning
+
+    def _cross_validate(
+        self,
+        pipeline: Any,
+        X: pd.DataFrame,
+        y: pd.Series,
+        cv: Any,
+        fit_groups: list[str] | None,
+        task_type: str,
+    ) -> tuple[list[dict[str, Any]], list[int], list[float]]:
+        """按折训练/评估，管道（含标准化）折内拟合，杜绝数据泄漏。"""
+        from sklearn.base import clone
+
+        fold_metrics: list[dict[str, Any]] = []
+        oof_positions: list[int] = []
+        oof_predictions: list[float] = []
+        splitter = (
+            cv.split(X, y, fit_groups) if fit_groups is not None else cv.split(X, y)
+        )
+        for fold_no, (train_positions, valid_positions) in enumerate(splitter, start=1):
+            model = clone(pipeline)
+            model.fit(X.iloc[train_positions], y.iloc[train_positions])
+            predicted = np.asarray(model.predict(X.iloc[valid_positions])).reshape(-1)
+            actual = y.iloc[valid_positions]
+            if task_type == "regression":
+                metrics = {
+                    "cv_r2": float(r2_score(actual, predicted))
+                    if len(actual) > 1
+                    else 0.0,
+                    "cv_mae": float(mean_absolute_error(actual, predicted)),
+                    "cv_rmse": float(np.sqrt(mean_squared_error(actual, predicted))),
+                }
+            else:
+                metrics = {
+                    "cv_accuracy": float(accuracy_score(actual, predicted)),
+                    "cv_f1": float(
+                        f1_score(actual, predicted, average="weighted", zero_division=0)
+                    ),
+                }
+            fold_metrics.append({"fold": fold_no, "size": len(valid_positions), **metrics})
+            oof_positions.extend(int(pos) for pos in valid_positions)
+            oof_predictions.extend(float(value) for value in predicted)
+        return fold_metrics, oof_positions, oof_predictions
 
     @staticmethod
     def _model_parameters(estimator: Any) -> dict[str, Any]:
@@ -562,6 +700,11 @@ class MLService:
         y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
         train_groups = [groups[int(index)] for index in train_idx]
         original_train_samples = len(X_train)
+        # 交叉验证在增强前的原始训练集上进行，保持样本-行映射并避免评估阶段引入合成样本。
+        cv_X = X_train.reset_index(drop=True)
+        cv_y = y_train.reset_index(drop=True)
+        cv_groups = list(train_groups)
+        cv_row_ids = [row_ids[int(index)] for index in train_idx]
         X_train, y_train, train_groups, augmented_samples = self._augment_training(
             X_train,
             y_train,
@@ -572,6 +715,8 @@ class MLService:
         )
         if len(X_test) < 1:
             raise AppError(code="test_set_empty", message="测试集为空", status_code=422)
+        cv_strategy = str((run["split_config"] or {}).get("cv_strategy", "group_kfold"))
+        cv_warnings: list[str] = []
 
         self.db.execute(delete(models_table).where(models_table.c.ml_run_id == run_id))
         config = run["preprocessing_config"] or {}
@@ -593,17 +738,17 @@ class MLService:
             preprocessor = self._preprocessor(input_types, config)
             pipeline = Pipeline([("preprocessor", preprocessor), ("model", estimator)])
             cv_metric: tuple[str, float] | None = None
+            requested_folds = int((run["split_config"] or {}).get("cv_folds", 5))
+            cv, fit_groups, folds, cv_warning = self._resolve_cv(
+                cv_strategy,
+                requested_folds,
+                train_groups,
+                len(X_train),
+                run["random_seed"] or 42,
+            )
+            if cv_warning and cv_warning not in cv_warnings:
+                cv_warnings.append(cv_warning)
             if config.get("parameter_search", True) and len(X_train) >= 4:
-                requested_folds = int((run["split_config"] or {}).get("cv_folds", 5))
-                unique_train_groups = len(set(train_groups))
-                if unique_train_groups >= 2:
-                    folds = min(requested_folds, unique_train_groups)
-                    cv = GroupKFold(n_splits=folds)
-                    fit_groups: list[str] | None = train_groups
-                else:
-                    folds = min(requested_folds, len(X_train))
-                    cv = KFold(n_splits=folds, shuffle=True, random_state=run["random_seed"] or 42)
-                    fit_groups = None
                 scoring = (
                     "neg_root_mean_squared_error"
                     if run["task_type"] == "regression"
@@ -773,6 +918,83 @@ class MLService:
                     for source_index, actual, pred in zip(test_idx, y_test, predicted, strict=False)
                 ],
             )
+            fold_summary: dict[str, Any] | None = None
+            if len(cv_X) >= 4:
+                explicit_cv, explicit_groups, explicit_folds, explicit_warning = self._resolve_cv(
+                    cv_strategy,
+                    requested_folds,
+                    cv_groups,
+                    len(cv_X),
+                    run["random_seed"] or 42,
+                )
+                if explicit_warning and explicit_warning not in cv_warnings:
+                    cv_warnings.append(explicit_warning)
+                fold_metrics, oof_positions, oof_predictions = self._cross_validate(
+                    pipeline, cv_X, cv_y, explicit_cv, explicit_groups, run["task_type"]
+                )
+                if fold_metrics:
+                    metric_names = [key for key in fold_metrics[0] if key.startswith("cv_")]
+                    self.db.execute(
+                        insert(metrics_table),
+                        [
+                            {
+                                "ml_model_id": model_id,
+                                "dataset_field_id": target_ids[0],
+                                "split_name": f"cv_fold_{fold['fold']}",
+                                "metric_name": name,
+                                "metric_value": float(fold[name]),
+                                "metric_payload": {
+                                    "strategy": cv_strategy,
+                                    "fold_size": fold["size"],
+                                },
+                            }
+                            for fold in fold_metrics
+                            for name in metric_names
+                        ],
+                    )
+                    fold_summary = {
+                        "strategy": cv_strategy,
+                        "folds": explicit_folds,
+                        "per_fold": fold_metrics,
+                        "mean": {
+                            name: float(
+                                np.mean([fold[name] for fold in fold_metrics])
+                            )
+                            for name in metric_names
+                        },
+                        "std": {
+                            name: float(np.std([fold[name] for fold in fold_metrics]))
+                            for name in metric_names
+                        },
+                    }
+                    self.db.execute(
+                        insert(predictions_table),
+                        [
+                            {
+                                "ml_model_id": model_id,
+                                "dataset_row_id": cv_row_ids[position],
+                                "target_field_id": target_ids[0],
+                                "split_name": "cross_validation",
+                                "actual_value": {
+                                    "value": (
+                                        cv_y.iloc[position].item()
+                                        if hasattr(cv_y.iloc[position], "item")
+                                        else cv_y.iloc[position]
+                                    )
+                                },
+                                "predicted_value": {"value": float(prediction)},
+                                "residual_value": (
+                                    float(cv_y.iloc[position] - prediction)
+                                    if run["task_type"] == "regression"
+                                    else None
+                                ),
+                                "metadata": {"strategy": cv_strategy},
+                            }
+                            for position, prediction in zip(
+                                oof_positions, oof_predictions, strict=False
+                            )
+                        ],
+                    )
             if config.get("explain", True):
                 scoring = (
                     "neg_root_mean_squared_error"
@@ -849,6 +1071,7 @@ class MLService:
                     "algorithm": code,
                     "metrics": metric_values,
                     "cross_validation": {cv_metric[0]: cv_metric[1]} if cv_metric else None,
+                    "cv_folds": fold_summary,
                     "explained": bool(config.get("explain", True)),
                 }
             )
@@ -873,6 +1096,8 @@ class MLService:
             "original_train_samples": original_train_samples,
             "augmented_samples": augmented_samples,
             "test_samples": len(test_idx),
+            "cv_strategy": cv_strategy,
+            "cv_warnings": cv_warnings,
         }
         self.db.execute(
             update(runs)

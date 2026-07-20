@@ -222,6 +222,47 @@ def test_derived_feature_spec_requires_two_operands_for_ratio() -> None:
         DerivedFeatureSpec(key="bad", op="ratio", operands=["a", "b", "c"])
 
 
+def test_score_predictions_unifies_directions() -> None:
+    predicted = np.array([1.0, 2.0, 3.0])
+    assert list(MLService._score_predictions(predicted, {"direction": "maximize"})) == [
+        -1.0,
+        -2.0,
+        -3.0,
+    ]
+    assert list(MLService._score_predictions(predicted, {"direction": "minimize"})) == [
+        1.0,
+        2.0,
+        3.0,
+    ]
+    target_scores = MLService._score_predictions(
+        predicted, {"direction": "target", "target": 2.0}
+    )
+    assert list(target_scores) == [1.0, 0.0, 1.0]
+
+
+def test_out_of_domain_flags_points_outside_training_range() -> None:
+    frame = pd.DataFrame({"temp": [25.0, 60.0, 10.0], "ph": [7.0, 7.0, 7.0]})
+    ranges = {"temp": {"min": 20.0, "max": 40.0}, "ph": {"min": 6.0, "max": 8.0}}
+    flags, violations = MLService._out_of_domain(frame, ranges)
+    assert list(flags) == [False, True, True]
+    assert violations[1] == ["temp"]
+    assert violations[2] == ["temp"]
+
+
+def test_optimization_defaults_include_grid_and_ensemble() -> None:
+    from app.schemas.ml import OptimizationCreate
+
+    payload = OptimizationCreate(
+        name="opt",
+        ml_model_id="00000000-0000-0000-0000-000000000001",
+        ml_model_ids=["00000000-0000-0000-0000-000000000002"],
+    )
+    assert payload.method == "random_search"
+    ids = [str(item) for item in payload.model_id_list]
+    assert ids[0] == "00000000-0000-0000-0000-000000000001"
+    assert "00000000-0000-0000-0000-000000000002" in ids
+
+
 def test_cross_validate_returns_out_of_fold_predictions_for_every_row() -> None:
     from sklearn.linear_model import Ridge
     from sklearn.model_selection import KFold

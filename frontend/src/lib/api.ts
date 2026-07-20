@@ -1020,8 +1020,11 @@ export const api = {
     payload: {
       name: string
       ml_model_id: string
+      ml_model_ids?: string[]
+      method?: 'random_search' | 'grid_search'
       objective: Record<string, unknown>
       constraints: Record<string, Record<string, unknown>>
+      grid_points?: number
       sample_count: number
       top_n: number
       random_seed: number
@@ -1031,6 +1034,8 @@ export const api = {
       method: 'POST',
       body: json(payload),
     }),
+  optimizationExportUrl: (projectId: string, runId: string) =>
+    `/api/v1/projects/${projectId}/optimization-runs/${runId}/export`,
   reports: (projectId: string) =>
     request<ReportItem[]>(`/projects/${projectId}/reports`),
   createReport: (

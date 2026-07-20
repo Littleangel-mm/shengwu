@@ -170,8 +170,18 @@ class MultiPredictionRequest(BaseModel):
 class OptimizationCreate(BaseModel):
     name: str = Field(min_length=1, max_length=240)
     ml_model_id: UUID
-    objective: dict[str, Any]
-    constraints: dict[str, dict[str, Any]]
-    sample_count: int = Field(default=3000, ge=100, le=100000)
+    ml_model_ids: list[UUID] | None = Field(default=None, max_length=20)
+    method: Literal["random_search", "grid_search"] = "random_search"
+    objective: dict[str, Any] = Field(default_factory=dict)
+    constraints: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    grid_points: int = Field(default=8, ge=2, le=50)
+    sample_count: int = Field(default=3000, ge=100, le=200000)
     top_n: int = Field(default=20, ge=1, le=500)
     random_seed: int = 42
+
+    @property
+    def model_id_list(self) -> list[UUID]:
+        ids = list(self.ml_model_ids or [])
+        if self.ml_model_id not in ids:
+            ids.insert(0, self.ml_model_id)
+        return ids

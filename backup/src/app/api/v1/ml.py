@@ -1,7 +1,7 @@
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Response
 
 from app.api.deps import ActorId, DbSession
 from app.core.config import get_settings
@@ -77,3 +77,13 @@ def list_optimizations(project_id: UUID, db: DbSession):
 @router.get("/{project_id}/optimization-runs/{run_id}", response_model=dict[str, Any])
 def get_optimization(project_id: UUID, run_id: UUID, db: DbSession):
     return service(db).get_optimization(project_id, run_id)
+
+
+@router.get("/{project_id}/optimization-runs/{run_id}/export")
+def export_optimization(project_id: UUID, run_id: UUID, db: DbSession):
+    filename, content = service(db).export_optimization_csv(project_id, run_id)
+    return Response(
+        content=content,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )

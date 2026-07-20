@@ -1,11 +1,14 @@
+import csv
 import hashlib
 import hmac
 import io
+import json
 import platform
 import warnings
 from collections import defaultdict
 from collections.abc import Callable
 from importlib.metadata import version as package_version
+from itertools import product
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -1573,13 +1576,15 @@ class MLService:
     def create_optimization(
         self, project_id: UUID, payload: OptimizationCreate, actor_id: UUID | None
     ) -> TaskAccepted:
-        _, artifact = self._load_model(project_id, payload.ml_model_id)
-        if artifact["task_type"] != "regression":
-            raise AppError(
-                code="optimization_requires_regression",
-                message="反向优化仅支持回归模型",
-                status_code=422,
-            )
+        model_ids = payload.model_id_list
+        for model_id in model_ids:
+            _, artifact = self._load_model(project_id, model_id)
+            if artifact["task_type"] != "regression":
+                raise AppError(
+                    code="optimization_requires_regression",
+                    message="反向优化仅支持回归模型",
+                    status_code=422,
+                )
         runs = table(self.db, "optimization_runs")
         run_id = self.db.execute(
             insert(runs)
@@ -1587,7 +1592,7 @@ class MLService:
                 project_id=project_id,
                 ml_model_id=payload.ml_model_id,
                 name=payload.name,
-                method="random_search",
+                method=payload.method,
                 status="queued",
                 objective_config=payload.objective,
                 constraint_config=payload.constraints,
@@ -1595,6 +1600,8 @@ class MLService:
                     "sample_count": payload.sample_count,
                     "top_n": payload.top_n,
                     "random_seed": payload.random_seed,
+                    "grid_points": payload.grid_points,
+                    "model_ids": [str(model_id) for model_id in model_ids],
                 },
                 result_summary={},
                 created_by=actor_id,
@@ -1629,57 +1636,146 @@ class MLService:
             ).mappings()
         ]
 
+    @staticmethod
+    def _score_predictions(predicted: np.ndarray, objective: dict[str, Any]) -> np.ndarray:
+        """统一 maximize/minimize/target 打分：分值越小越优（供 argsort 升序取 Top-N）。"""
+        values = np.asarray(predicted, dtype=float)
+        direction = objective.get("direction", "target")
+        if direction == "maximize":
+            return -values
+        if direction == "minimize":
+            return values
+        target = float(objective.get("target", 0))
+        return np.square(values - target)
+
+    @staticmethod
+    def _out_of_domain(
+        frame: pd.DataFrame, training_ranges: dict[str, dict[str, float]]
+    ) -> tuple[np.ndarray, list[list[str]]]:
+        """标记落在训练数据范围之外的候选点（适用域分析），返回布尔向量与逐点越界字段。"""
+        flags = np.zeros(len(frame), dtype=bool)
+        violations: list[list[str]] = [[] for _ in range(len(frame))]
+        if not training_ranges:
+            return flags, violations
+        for key, bounds in training_ranges.items():
+            if key not in frame.columns:
+                continue
+            column = pd.to_numeric(frame[key], errors="coerce").to_numpy(dtype=float)
+            span = bounds["max"] - bounds["min"]
+            tolerance = abs(span) * 0.001
+            below = column < (bounds["min"] - tolerance)
+            above = column > (bounds["max"] + tolerance)
+            outside = below | above
+            for position in np.nonzero(outside)[0]:
+                flags[position] = True
+                violations[int(position)].append(key)
+        return flags, violations
+
+    def _ensemble_predict(
+        self, artifacts: list[dict[str, Any]], frame: pd.DataFrame
+    ) -> tuple[np.ndarray, np.ndarray, list[dict[str, Any]]]:
+        """多模型集成：返回逐点预测均值、模型间标准差，以及主模型的不确定性明细。"""
+        per_model: list[np.ndarray] = []
+        primary_uncertainty: list[dict[str, Any]] = []
+        for position, artifact in enumerate(artifacts):
+            predicted, uncertainty_rows = self._predict_with_uncertainty(artifact, frame)
+            per_model.append(np.asarray(predicted, dtype=float))
+            if position == 0:
+                primary_uncertainty = uncertainty_rows
+        stacked = np.vstack(per_model)
+        mean = stacked.mean(axis=0)
+        ensemble_std = stacked.std(axis=0, ddof=1) if len(artifacts) > 1 else np.zeros(len(mean))
+        return mean, ensemble_std, primary_uncertainty
+
     def optimize(self, run_id: UUID, progress: Callable[[float, str], None]) -> dict[str, Any]:
         runs = table(self.db, "optimization_runs")
         candidates = table(self.db, "optimization_candidates")
         run = self.db.execute(select(runs).where(runs.c.id == run_id)).mappings().one_or_none()
         if not run:
             raise AppError(code="optimization_not_found", message="优化任务不存在", status_code=404)
-        _, artifact = self._load_model(run["project_id"], run["ml_model_id"])
+        config = run["search_config"] or {}
+        model_ids = config.get("model_ids") or [str(run["ml_model_id"])]
+        artifacts = [
+            self._load_model(run["project_id"], UUID(model_id))[1] for model_id in model_ids
+        ]
+        artifact = artifacts[0]
         raw_keys = artifact.get("raw_input_keys") or artifact["input_keys"]
-        constraints = run["constraint_config"] or {}
+        training_ranges = artifact.get("training_ranges") or {}
+        constraints = dict(run["constraint_config"] or {})
+        # 约束缺省：未指定的输入字段自动采用训练数据范围（客户"默认即可跑"）。
+        for key in raw_keys:
+            if key not in constraints and key in training_ranges:
+                constraints[key] = {
+                    "min": training_ranges[key]["min"],
+                    "max": training_ranges[key]["max"],
+                }
         missing = [key for key in raw_keys if key not in constraints]
         if missing:
             raise AppError(
                 code="optimization_constraints_missing",
-                message="缺少输入约束",
+                message="缺少输入约束，且训练域范围不可用",
                 status_code=422,
                 details=missing,
             )
-        config = run["search_config"] or {}
         sample_count = int(config.get("sample_count", 3000))
         rng = np.random.default_rng(int(config.get("random_seed", 42)))
-        data = {}
-        for key in raw_keys:
-            rule = constraints[key]
-            if "values" in rule:
-                data[key] = rng.choice(rule["values"], size=sample_count)
-            else:
-                data[key] = rng.uniform(float(rule["min"]), float(rule["max"]), size=sample_count)
-        frame = pd.DataFrame(data)
-        progress(35, "predicting_candidates")
-        predicted, uncertainty_rows = self._predict_with_uncertainty(artifact, frame)
-        objective = run["objective_config"] or {}
-        direction = objective.get("direction", "target")
-        if direction == "maximize":
-            scores = -np.asarray(predicted, dtype=float)
-        elif direction == "minimize":
-            scores = np.asarray(predicted, dtype=float)
+        method = run["method"] or "random_search"
+        if method == "grid_search":
+            grid_points = int(config.get("grid_points", 8))
+            axes: list[list[Any]] = []
+            for key in raw_keys:
+                rule = constraints[key]
+                if "values" in rule:
+                    axes.append(list(rule["values"]))
+                else:
+                    axes.append(
+                        [float(value) for value in np.linspace(
+                            float(rule["min"]), float(rule["max"]), grid_points
+                        )]
+                    )
+            combos: list[tuple[Any, ...]] = []
+            for combo in product(*axes):
+                combos.append(combo)
+                if len(combos) >= sample_count:
+                    break
+            frame = pd.DataFrame(combos, columns=raw_keys)
         else:
-            target = float(objective.get("target", 0))
-            scores = np.square(np.asarray(predicted, dtype=float) - target)
-        top_n = min(int(config.get("top_n", 20)), sample_count)
+            data = {}
+            for key in raw_keys:
+                rule = constraints[key]
+                if "values" in rule:
+                    data[key] = rng.choice(rule["values"], size=sample_count)
+                else:
+                    data[key] = rng.uniform(
+                        float(rule["min"]), float(rule["max"]), size=sample_count
+                    )
+            frame = pd.DataFrame(data)
+        evaluated = len(frame)
+        progress(35, "predicting_candidates")
+        predicted, ensemble_std, uncertainty_rows = self._ensemble_predict(artifacts, frame)
+        objective = run["objective_config"] or {}
+        base_scores = self._score_predictions(predicted, objective)
+        domain_flags, domain_violations = self._out_of_domain(frame, training_ranges)
+        # 适用域惩罚：越界点整体排到有效点之后，但仍保留展示（可解释）。
+        score_range = float(np.ptp(base_scores)) + 1.0 if len(base_scores) else 1.0
+        scores = base_scores + domain_flags.astype(float) * score_range
+        top_n = min(int(config.get("top_n", 20)), evaluated)
         top_indices = np.argsort(scores)[:top_n]
         self.db.execute(delete(candidates).where(candidates.c.optimization_run_id == run_id))
         rows = []
         for rank, idx in enumerate(top_indices, start=1):
+            position = int(idx)
             inputs = {
-                key: frame.iloc[int(idx)][key].item()
-                if hasattr(frame.iloc[int(idx)][key], "item")
-                else frame.iloc[int(idx)][key]
+                key: frame.iloc[position][key].item()
+                if hasattr(frame.iloc[position][key], "item")
+                else frame.iloc[position][key]
                 for key in raw_keys
             }
-            pred = predicted[int(idx)]
+            pred = predicted[position]
+            uncertainty = dict(uncertainty_rows[position]) if uncertainty_rows else {}
+            if len(artifacts) > 1:
+                uncertainty["ensemble_std"] = float(ensemble_std[position])
+                uncertainty["model_count"] = len(artifacts)
             rows.append(
                 {
                     "optimization_run_id": run_id,
@@ -1688,27 +1784,35 @@ class MLService:
                     "predicted_values": {
                         artifact["target_key"]: pred.item() if hasattr(pred, "item") else pred
                     },
-                    "uncertainty": uncertainty_rows[int(idx)],
-                    "objective_score": float(scores[int(idx)]),
-                    "is_feasible": True,
-                    "constraint_violations": [],
-                    "metadata": {},
+                    "uncertainty": uncertainty,
+                    "objective_score": float(scores[position]),
+                    "is_feasible": not bool(domain_flags[position]),
+                    "constraint_violations": domain_violations[position],
+                    "metadata": {"in_applicability_domain": not bool(domain_flags[position])},
                 }
             )
         self.db.execute(insert(candidates), rows)
+        validation_plan = self._build_validation_plan(
+            artifacts, raw_keys, constraints, rows, artifact["target_key"]
+        )
         summary = {
+            "method": method,
             "candidate_count": top_n,
-            "evaluated": sample_count,
+            "evaluated": evaluated,
+            "model_count": len(artifacts),
+            "in_domain_count": int(np.sum(~domain_flags[top_indices])),
             "best": (
                 {
                     "input_values": rows[0]["input_values"],
                     "predicted_values": rows[0]["predicted_values"],
                     "objective_score": rows[0]["objective_score"],
                     "uncertainty": rows[0]["uncertainty"],
+                    "in_applicability_domain": rows[0]["is_feasible"],
                 }
                 if rows
                 else None
             ),
+            "validation_plan": validation_plan,
         }
         self.db.execute(
             update(runs)
@@ -1718,6 +1822,44 @@ class MLService:
         self.db.commit()
         progress(100, "completed")
         return summary
+
+    def _build_validation_plan(
+        self,
+        artifacts: list[dict[str, Any]],
+        raw_keys: list[str],
+        constraints: dict[str, dict[str, Any]],
+        rows: list[dict[str, Any]],
+        target_key: str,
+    ) -> dict[str, Any]:
+        """生成验证实验方案：对照组（各输入取范围中点/首个取值）+ Top-N 推荐组。"""
+        control_inputs: dict[str, Any] = {}
+        for key in raw_keys:
+            rule = constraints[key]
+            if "values" in rule and rule["values"]:
+                control_inputs[key] = rule["values"][0]
+            else:
+                control_inputs[key] = (float(rule["min"]) + float(rule["max"])) / 2
+        control_frame = pd.DataFrame([control_inputs])
+        control_pred, _, control_unc = self._ensemble_predict(artifacts, control_frame)
+        return {
+            "control_group": {
+                "label": "对照组（输入取范围中点）",
+                "input_values": control_inputs,
+                "predicted_values": {
+                    target_key: float(control_pred[0]) if len(control_pred) else None
+                },
+                "uncertainty": control_unc[0] if control_unc else {},
+            },
+            "recommendation_group": [
+                {
+                    "rank_no": row["rank_no"],
+                    "input_values": row["input_values"],
+                    "predicted_values": row["predicted_values"],
+                    "in_applicability_domain": row["is_feasible"],
+                }
+                for row in rows[: min(5, len(rows))]
+            ],
+        }
 
     def get_optimization(self, project_id: UUID, run_id: UUID) -> dict:
         runs = table(self.db, "optimization_runs")
@@ -1741,3 +1883,42 @@ class MLService:
             ).mappings()
         ]
         return result
+
+    def export_optimization_csv(self, project_id: UUID, run_id: UUID) -> tuple[str, bytes]:
+        """把 Top-N 推荐结果导出为 CSV（UTF-8 BOM，Excel 可直接打开）。"""
+        detail = self.get_optimization(project_id, run_id)
+        candidate_rows = detail.get("candidates") or []
+        input_keys: list[str] = []
+        target_keys: list[str] = []
+        for row in candidate_rows:
+            for key in (row.get("input_values") or {}):
+                if key not in input_keys:
+                    input_keys.append(key)
+            for key in (row.get("predicted_values") or {}):
+                if key not in target_keys:
+                    target_keys.append(key)
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+        header = (
+            ["排名"]
+            + input_keys
+            + [f"预测_{key}" for key in target_keys]
+            + ["在适用域内", "目标分值", "不确定性"]
+        )
+        writer.writerow(header)
+        for row in candidate_rows:
+            inputs = row.get("input_values") or {}
+            predicted = row.get("predicted_values") or {}
+            uncertainty = row.get("uncertainty") or {}
+            writer.writerow(
+                [row.get("rank_no")]
+                + [inputs.get(key) for key in input_keys]
+                + [predicted.get(key) for key in target_keys]
+                + [
+                    "是" if row.get("is_feasible") else "否",
+                    row.get("objective_score"),
+                    json.dumps(uncertainty, ensure_ascii=False),
+                ]
+            )
+        content = ("\ufeff" + buffer.getvalue()).encode("utf-8")
+        return f"optimization-{run_id}.csv", content

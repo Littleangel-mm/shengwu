@@ -3402,6 +3402,8 @@ function MLSection({ projectId }: { projectId: string }) {
   const [predictionValues, setPredictionValues] = useState('{}')
   const [predictionResult, setPredictionResult] = useState<unknown>(null)
   const [optimizationConstraints, setOptimizationConstraints] = useState('{}')
+  const [optMethod, setOptMethod] = useState<'random_search' | 'grid_search'>('random_search')
+  const [optDirection, setOptDirection] = useState<'maximize' | 'minimize'>('maximize')
   const [selectedOptimizationId, setSelectedOptimizationId] = useState('')
   const [selectedJob, setSelectedJob] = useState<JobItem | null>(null)
   const datasets = useQuery({
@@ -3498,8 +3500,10 @@ function MLSection({ projectId }: { projectId: string }) {
       api.createOptimization(projectId, {
         name: `${run.data?.name || '模型'}方案优化`,
         ml_model_id: model.id,
-        objective: { direction: 'maximize' },
-        constraints: JSON.parse(optimizationConstraints) as Record<string, Record<string, unknown>>,
+        method: optMethod,
+        objective: { direction: optDirection },
+        constraints: JSON.parse(optimizationConstraints || '{}') as Record<string, Record<string, unknown>>,
+        grid_points: 8,
         sample_count: 3000,
         top_n: 20,
         random_seed: 42,
@@ -3662,18 +3666,36 @@ function MLSection({ projectId }: { projectId: string }) {
                 <button className="button button-secondary" disabled={!canWrite} onClick={() => predict.mutate(models.map((model) => model.id))}>多模型预测</button>
               </div>
               {predictionResult != null && <pre className="result-json">{JSON.stringify(predictionResult, null, 2)}</pre>}
-              <label><span>优化变量范围（JSON，如 {`{"temperature":{"min":20,"max":35}}`}）</span><textarea value={optimizationConstraints} onChange={(event) => setOptimizationConstraints(event.target.value)} rows={4} /></label>
+              <div className="button-row">
+                <label><span>搜索方法</span><select value={optMethod} onChange={(event) => setOptMethod(event.target.value as typeof optMethod)}>
+                  <option value="random_search">随机搜索</option>
+                  <option value="grid_search">网格搜索</option>
+                </select></label>
+                <label><span>优化方向</span><select value={optDirection} onChange={(event) => setOptDirection(event.target.value as typeof optDirection)}>
+                  <option value="maximize">最大化目标</option>
+                  <option value="minimize">最小化目标</option>
+                </select></label>
+              </div>
+              <label><span>优化变量范围（JSON，留空则默认使用训练数据范围，如 {`{"temperature":{"min":20,"max":35}}`}）</span><textarea value={optimizationConstraints} onChange={(event) => setOptimizationConstraints(event.target.value)} rows={4} /></label>
               <button className="button button-primary" disabled={!canWrite || run.data?.task_type !== 'regression' || createOptimization.isPending} onClick={() => createOptimization.mutate(selectedModel)}>创建优化任务</button>
               <ErrorNotice error={predict.error || createOptimization.error} />
             </div>
           )}
           {optimizations.data?.length ? (
             <div className="optimization-list">
-              <select value={selectedOptimizationId} onChange={(event) => setSelectedOptimizationId(event.target.value)}>
-                <option value="">选择优化运行</option>{optimizations.data.map((item) => <option value={item.id} key={item.id}>{item.name} · {item.status}</option>)}
-              </select>
+              <div className="button-row">
+                <select value={selectedOptimizationId} onChange={(event) => setSelectedOptimizationId(event.target.value)}>
+                  <option value="">选择优化运行</option>{optimizations.data.map((item) => <option value={item.id} key={item.id}>{item.name} · {item.status}</option>)}
+                </select>
+                {selectedOptimizationId && <a className="button button-secondary" href={api.optimizationExportUrl(projectId, selectedOptimizationId)} download>导出 CSV</a>}
+              </div>
               {optimization.data?.candidates?.map((candidate) => (
-                <article key={candidate.id}><strong>#{candidate.rank_no}</strong><span>{JSON.stringify(candidate.input_values)}</span><span>{JSON.stringify(candidate.predicted_values)}</span><small>{JSON.stringify(candidate.uncertainty)}</small></article>
+                <article key={candidate.id} className={candidate.is_feasible === false ? 'candidate out-of-domain' : 'candidate'}>
+                  <strong>#{candidate.rank_no}{candidate.is_feasible === false ? '（超出适用域）' : ''}</strong>
+                  <span>{JSON.stringify(candidate.input_values)}</span>
+                  <span>{JSON.stringify(candidate.predicted_values)}</span>
+                  <small>{JSON.stringify(candidate.uncertainty)}</small>
+                </article>
               ))}
             </div>
           ) : null}

@@ -77,12 +77,19 @@ def _default_algorithms() -> list[MLAlgorithm]:
     return ["ridge", "random_forest", "gradient_boosting"]
 
 
+class TargetObjective(BaseModel):
+    field_id: UUID
+    direction: Literal["maximize", "minimize"] = "maximize"
+    weight: float = Field(default=1.0, gt=0, le=100)
+
+
 class MLRunCreate(BaseModel):
     name: str = Field(min_length=1, max_length=240)
     dataset_version_id: UUID
     task_type: Literal["regression", "classification"] = "regression"
     input_field_ids: list[UUID] = Field(min_length=1, max_length=200)
-    target_field_id: UUID
+    target_field_id: UUID | None = None
+    targets: list[TargetObjective] | None = Field(default=None, max_length=20)
     algorithms: list[MLAlgorithm] = Field(
         default_factory=_default_algorithms,
         min_length=1,
@@ -112,6 +119,25 @@ class MLRunCreate(BaseModel):
         if invalid:
             raise ValueError(f"算法与任务类型不兼容: {', '.join(invalid)}")
         return self
+
+    @model_validator(mode="after")
+    def validate_targets(self) -> "MLRunCreate":
+        if self.targets:
+            if len(self.targets) > 1 and self.task_type != "regression":
+                raise ValueError("多目标加权仅支持回归任务")
+            field_ids = [target.field_id for target in self.targets]
+            if len(set(field_ids)) != len(field_ids):
+                raise ValueError("目标字段不能重复")
+        elif self.target_field_id is None:
+            raise ValueError("必须指定 target_field_id 或 targets")
+        return self
+
+    @property
+    def target_specs(self) -> list[TargetObjective]:
+        if self.targets:
+            return self.targets
+        assert self.target_field_id is not None
+        return [TargetObjective(field_id=self.target_field_id)]
 
 
 class PredictionRequest(BaseModel):

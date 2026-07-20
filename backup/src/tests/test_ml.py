@@ -111,6 +111,69 @@ def test_resolve_cv_degrades_explicitly_when_groups_insufficient() -> None:
     assert warning is not None
 
 
+def test_target_specs_default_to_single_target() -> None:
+    payload = MLRunCreate(
+        name="single",
+        dataset_version_id="00000000-0000-0000-0000-000000000001",
+        input_field_ids=["00000000-0000-0000-0000-000000000002"],
+        target_field_id="00000000-0000-0000-0000-000000000003",
+    )
+    specs = payload.target_specs
+    assert len(specs) == 1
+    assert str(specs[0].field_id) == "00000000-0000-0000-0000-000000000003"
+    assert specs[0].direction == "maximize"
+
+
+def test_multi_objective_requires_regression() -> None:
+    with pytest.raises(ValidationError):
+        MLRunCreate(
+            name="multi",
+            dataset_version_id="00000000-0000-0000-0000-000000000001",
+            task_type="classification",
+            input_field_ids=["00000000-0000-0000-0000-000000000002"],
+            targets=[
+                {"field_id": "00000000-0000-0000-0000-000000000003", "direction": "maximize"},
+                {"field_id": "00000000-0000-0000-0000-000000000004", "direction": "minimize"},
+            ],
+        )
+
+
+def test_multi_objective_rejects_duplicate_targets() -> None:
+    with pytest.raises(ValidationError):
+        MLRunCreate(
+            name="dup",
+            dataset_version_id="00000000-0000-0000-0000-000000000001",
+            input_field_ids=["00000000-0000-0000-0000-000000000002"],
+            targets=[
+                {"field_id": "00000000-0000-0000-0000-000000000003"},
+                {"field_id": "00000000-0000-0000-0000-000000000003"},
+            ],
+        )
+
+
+def test_compose_objective_uses_train_only_scale_and_directions() -> None:
+    train = pd.DataFrame({"yield": [10.0, 20.0, 30.0], "cost": [100.0, 200.0, 300.0]})
+    # 测试集含超出训练范围的极值，用于验证按训练范围裁剪、不反向泄漏尺度。
+    test = pd.DataFrame({"yield": [40.0], "cost": [50.0]})
+    objectives = [
+        {"key": "yield", "direction": "maximize", "weight": 3.0},
+        {"key": "cost", "direction": "minimize", "weight": 1.0},
+    ]
+    composite_train, composite_test, stats = MLService._compose_objective(
+        train, test, objectives
+    )
+    # 权重归一化：yield 0.75、cost 0.25。
+    assert stats[0]["weight"] == pytest.approx(0.75)
+    assert stats[1]["weight"] == pytest.approx(0.25)
+    assert stats[0]["train_min"] == 10.0 and stats[0]["train_max"] == 30.0
+    # 行0: yield=10(max→0), cost=100(minimize,归一0→1): 0.75*0 + 0.25*1 = 0.25
+    assert composite_train.iloc[0] == pytest.approx(0.25)
+    # 行2: yield=30(max→1), cost=300(minimize,归一1→0): 0.75*1 + 0.25*0 = 0.75
+    assert composite_train.iloc[2] == pytest.approx(0.75)
+    # 测试样本被裁剪到训练范围: yield>max→1, cost<min→0(minimize→1): 0.75+0.25=1.0
+    assert composite_test.iloc[0] == pytest.approx(1.0)
+
+
 def test_cross_validate_returns_out_of_fold_predictions_for_every_row() -> None:
     from sklearn.linear_model import Ridge
     from sklearn.model_selection import KFold

@@ -972,7 +972,8 @@ export const api = {
       dataset_version_id: string
       task_type: 'regression' | 'classification'
       input_field_ids: string[]
-      target_field_id: string
+      target_field_id?: string
+      targets?: { field_id: string; direction: 'maximize' | 'minimize'; weight: number }[]
       algorithms: string[]
       random_seed: number
       test_size: number

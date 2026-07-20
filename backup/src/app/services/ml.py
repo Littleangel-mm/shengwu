@@ -114,7 +114,17 @@ class MLService:
                 select(fields.c.id).where(fields.c.dataset_version_id == payload.dataset_version_id)
             ).all()
         )
-        selected = set(payload.input_field_ids) | {payload.target_field_id}
+        target_specs = payload.target_specs
+        target_ids = [spec.field_id for spec in target_specs]
+        objectives = [
+            {
+                "field_id": str(spec.field_id),
+                "direction": spec.direction,
+                "weight": float(spec.weight),
+            }
+            for spec in target_specs
+        ]
+        selected = set(payload.input_field_ids) | set(target_ids)
         if not selected.issubset(available):
             raise AppError(
                 code="invalid_ml_fields", message="建模字段不属于该数据集版本", status_code=422
@@ -147,6 +157,7 @@ class MLService:
                     "algorithms": payload.algorithms,
                     "parameter_search": payload.parameter_search,
                     "explain": payload.explain,
+                    "objectives": objectives,
                 },
                 augmentation_config={
                     "enabled": payload.augmentation_enabled,
@@ -175,11 +186,15 @@ class MLService:
             + [
                 {
                     "ml_run_id": run_id,
-                    "dataset_field_id": payload.target_field_id,
+                    "dataset_field_id": spec.field_id,
                     "role": "target",
-                    "position": 0,
-                    "transformation_config": {},
+                    "position": position,
+                    "transformation_config": {
+                        "direction": spec.direction,
+                        "weight": float(spec.weight),
+                    },
                 }
+                for position, spec in enumerate(target_specs)
             ],
         )
         job = ProcessingJob(
@@ -273,14 +288,14 @@ class MLService:
         self,
         dataset_version_id: UUID,
         input_ids: list[UUID],
-        target_id: UUID,
-    ) -> tuple[pd.DataFrame, pd.Series, list[UUID], list[str], str, dict[str, str]]:
+        target_ids: list[UUID],
+    ) -> tuple[pd.DataFrame, pd.DataFrame, list[UUID], list[str], list[str], dict[str, str]]:
         fields = table(self.db, "dataset_fields")
         rows = table(self.db, "dataset_rows")
         cells = table(self.db, "dataset_cells")
         field_rows = self.db.execute(
             select(fields.c.id, fields.c.field_key, fields.c.data_type).where(
-                fields.c.id.in_([*input_ids, target_id])
+                fields.c.id.in_([*input_ids, *target_ids])
             )
         ).all()
         keys = {field_id: key for field_id, key, _ in field_rows}
@@ -298,7 +313,7 @@ class MLService:
                     cells.c.row_id, cells.c.field_id, cells.c.value_number, cells.c.value_text
                 ).where(
                     cells.c.row_id.in_(row_ids),
-                    cells.c.field_id.in_([*input_ids, target_id]),
+                    cells.c.field_id.in_([*input_ids, *target_ids]),
                     cells.c.is_missing.is_(False),
                 )
             ):
@@ -310,17 +325,17 @@ class MLService:
         kept_rows = []
         for row_id, document_id in row_info:
             data = values.get(row_id, {})
-            if target_id not in data:
+            if any(target_id not in data for target_id in target_ids):
                 continue
             records.append(
                 {keys[field_id]: data.get(field_id) for field_id in input_ids}
-                | {keys[target_id]: data[target_id]}
+                | {keys[target_id]: data[target_id] for target_id in target_ids}
             )
             groups.append(str(document_id or row_id))
             kept_rows.append(row_id)
         frame = pd.DataFrame(records)
         input_keys = [keys[field_id] for field_id in input_ids]
-        target_key = keys[target_id]
+        target_keys = [keys[field_id] for field_id in target_ids]
         if frame.empty:
             raise AppError(
                 code="ml_data_empty", message="没有可用于建模的完整目标数据", status_code=422
@@ -332,7 +347,7 @@ class MLService:
                 frame[key] = pd.to_numeric(frame[key], errors="coerce")
             else:
                 frame[key] = frame[key].astype("string")
-        return frame[input_keys], frame[target_key], kept_rows, groups, target_key, input_types
+        return frame[input_keys], frame[target_keys], kept_rows, groups, target_keys, input_types
 
     @staticmethod
     def _optional_lightgbm(kind: str, seed: int):
@@ -541,6 +556,62 @@ class MLService:
         )
 
     @staticmethod
+    def _normalize_objective(
+        series: pd.Series, vmin: float, vmax: float, direction: str
+    ) -> np.ndarray:
+        span = vmax - vmin
+        numeric = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
+        if span <= 0:
+            base = np.zeros(len(numeric))
+        else:
+            base = (numeric - vmin) / span
+        # 用训练集范围裁剪测试样本，避免测试极值反向泄漏进归一化尺度。
+        base = np.clip(base, 0.0, 1.0)
+        if direction == "minimize":
+            base = 1.0 - base
+        return base
+
+    @classmethod
+    def _compose_objective(
+        cls,
+        Y_train: pd.DataFrame,
+        Y_test: pd.DataFrame,
+        objectives: list[dict[str, Any]],
+    ) -> tuple[pd.Series, pd.Series, list[dict[str, Any]]]:
+        """按方向+权重把多目标合成单一复合目标；归一化尺度只用训练集，杜绝泄漏。"""
+        total_weight = sum(float(item["weight"]) for item in objectives) or 1.0
+        composite_train = np.zeros(len(Y_train))
+        composite_test = np.zeros(len(Y_test))
+        stats: list[dict[str, Any]] = []
+        for item in objectives:
+            key = item["key"]
+            direction = item["direction"]
+            weight = float(item["weight"]) / total_weight
+            train_column = pd.to_numeric(Y_train[key], errors="coerce")
+            vmin = float(train_column.min())
+            vmax = float(train_column.max())
+            composite_train += weight * cls._normalize_objective(
+                Y_train[key], vmin, vmax, direction
+            )
+            composite_test += weight * cls._normalize_objective(
+                Y_test[key], vmin, vmax, direction
+            )
+            stats.append(
+                {
+                    "key": key,
+                    "direction": direction,
+                    "weight": weight,
+                    "train_min": vmin,
+                    "train_max": vmax,
+                }
+            )
+        return (
+            pd.Series(composite_train, index=Y_train.index),
+            pd.Series(composite_test, index=Y_test.index),
+            stats,
+        )
+
+    @staticmethod
     def _resolve_cv(
         strategy: str,
         requested_folds: int,
@@ -644,14 +715,29 @@ class MLService:
             .all()
         )
         input_ids = [row["dataset_field_id"] for row in field_rows if row["role"] == "input"]
-        target_ids = [row["dataset_field_id"] for row in field_rows if row["role"] == "target"]
-        if not input_ids or len(target_ids) != 1:
+        target_field_rows = [row for row in field_rows if row["role"] == "target"]
+        target_ids = [row["dataset_field_id"] for row in target_field_rows]
+        if not input_ids or not target_ids:
             raise AppError(
                 code="invalid_ml_configuration", message="建模输入或目标配置无效", status_code=422
             )
-        X, y, row_ids, groups, target_key, input_types = self._matrix(
-            run["dataset_version_id"], input_ids, target_ids[0]
+        config = run["preprocessing_config"] or {}
+        objectives_config = config.get("objectives") or []
+        objective_by_id = {item["field_id"]: item for item in objectives_config}
+        is_multi_objective = run["task_type"] == "regression" and len(target_ids) > 1
+        if len(target_ids) > 1 and run["task_type"] != "regression":
+            raise AppError(
+                code="invalid_ml_configuration",
+                message="多目标加权仅支持回归任务",
+                status_code=422,
+            )
+        X, Y, row_ids, groups, target_keys, input_types = self._matrix(
+            run["dataset_version_id"], input_ids, target_ids
         )
+        key_by_id = {
+            str(field_id): key
+            for field_id, key in zip(target_ids, target_keys, strict=False)
+        }
         if len(X) < 4:
             raise AppError(
                 code="insufficient_samples",
@@ -659,15 +745,19 @@ class MLService:
                 status_code=422,
             )
         label_encoder: LabelEncoder | None = None
+        y_single: pd.Series | None = None
         if run["task_type"] == "regression":
-            y = pd.to_numeric(y, errors="coerce")
-            valid = y.notna()
-            X, y = X.loc[valid], y.loc[valid]
+            for key in target_keys:
+                Y[key] = pd.to_numeric(Y[key], errors="coerce")
+            valid = Y.notna().all(axis=1)
+            X, Y = X.loc[valid], Y.loc[valid]
             row_ids = [row_id for row_id, keep in zip(row_ids, valid, strict=False) if keep]
             groups = [group for group, keep in zip(groups, valid, strict=False) if keep]
         else:
             label_encoder = LabelEncoder()
-            y = pd.Series(label_encoder.fit_transform(y.astype(str)), index=y.index)
+            y_single = pd.Series(
+                label_encoder.fit_transform(Y[target_keys[0]].astype(str)), index=Y.index
+            )
         if len(X) < 4:
             raise AppError(
                 code="insufficient_samples", message="清理无效目标值后样本不足", status_code=422
@@ -685,7 +775,7 @@ class MLService:
             splitter = GroupShuffleSplit(
                 n_splits=1, test_size=test_size, random_state=run["random_seed"] or 42
             )
-            train_idx, test_idx = next(splitter.split(X, y, groups))
+            train_idx, test_idx = next(splitter.split(X, None, groups))
         elif run["split_strategy"] == "random_split":
             train_idx, test_idx = train_test_split(
                 indices, test_size=test_size, random_state=run["random_seed"] or 42
@@ -696,8 +786,34 @@ class MLService:
                 message="不支持的数据切分策略",
                 status_code=422,
             )
+        objective_stats: list[dict[str, Any]] = []
+        if run["task_type"] == "regression":
+            resolved_objectives = [
+                {
+                    "key": key_by_id[str(field_id)],
+                    "direction": objective_by_id.get(str(field_id), {}).get(
+                        "direction", "maximize"
+                    ),
+                    "weight": float(objective_by_id.get(str(field_id), {}).get("weight", 1.0)),
+                }
+                for field_id in target_ids
+            ]
+            if is_multi_objective:
+                y_train, y_test, objective_stats = self._compose_objective(
+                    Y.iloc[train_idx], Y.iloc[test_idx], resolved_objectives
+                )
+                target_key = "composite_objective"
+            else:
+                target_key = target_keys[0]
+                y_train, y_test = (
+                    Y[target_key].iloc[train_idx],
+                    Y[target_key].iloc[test_idx],
+                )
+        else:
+            assert y_single is not None
+            target_key = target_keys[0]
+            y_train, y_test = y_single.iloc[train_idx], y_single.iloc[test_idx]
         X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
         train_groups = [groups[int(index)] for index in train_idx]
         original_train_samples = len(X_train)
         # 交叉验证在增强前的原始训练集上进行，保持样本-行映射并避免评估阶段引入合成样本。
@@ -719,7 +835,6 @@ class MLService:
         cv_warnings: list[str] = []
 
         self.db.execute(delete(models_table).where(models_table.c.ml_run_id == run_id))
-        config = run["preprocessing_config"] or {}
         algorithms = config.get("algorithms", ["ridge", "random_forest"])
         input_keys = list(X.columns)
         best_model_id = None
@@ -806,6 +921,8 @@ class MLService:
                 "task_type": run["task_type"],
                 "dataset_version_id": str(run["dataset_version_id"]),
                 "target_classes": label_encoder.classes_.tolist() if label_encoder else None,
+                "is_composite_objective": is_multi_objective,
+                "objectives": objective_stats,
                 "residual_std": (
                     float(np.std(np.asarray(y_test, dtype=float) - predicted, ddof=1))
                     if run["task_type"] == "regression" and len(predicted) > 1
@@ -1098,6 +1215,9 @@ class MLService:
             "test_samples": len(test_idx),
             "cv_strategy": cv_strategy,
             "cv_warnings": cv_warnings,
+            "is_composite_objective": is_multi_objective,
+            "objectives": objective_stats,
+            "target_key": target_key,
         }
         self.db.execute(
             update(runs)

@@ -3391,6 +3391,8 @@ function MLSection({ projectId }: { projectId: string }) {
   const [targetField, setTargetField] = useState('')
   const [algorithms, setAlgorithms] = useState<string[]>(['ridge', 'random_forest'])
   const [cvStrategy, setCvStrategy] = useState<'group_kfold' | 'leave_one_group_out' | 'kfold'>('group_kfold')
+  const [multiObjective, setMultiObjective] = useState(false)
+  const [objectives, setObjectives] = useState<{ field_id: string; direction: 'maximize' | 'minimize'; weight: number }[]>([])
   const [selectedRunId, setSelectedRunId] = useState('')
   const [predictionValues, setPredictionValues] = useState('{}')
   const [predictionResult, setPredictionResult] = useState<unknown>(null)
@@ -3443,7 +3445,9 @@ function MLSection({ projectId }: { projectId: string }) {
         dataset_version_id: datasetVersionId,
         task_type: taskType,
         input_field_ids: inputFields,
-        target_field_id: targetField,
+        ...(multiObjective
+          ? { targets: objectives.filter((item) => item.field_id) }
+          : { target_field_id: targetField }),
         algorithms,
         random_seed: 42,
         test_size: 0.2,
@@ -3541,14 +3545,35 @@ function MLSection({ projectId }: { projectId: string }) {
           <label><span>任务类型</span><select value={taskType} onChange={(event) => {
             const next = event.target.value as 'regression' | 'classification'
             setTaskType(next)
+            if (next !== 'regression') setMultiObjective(false)
             setAlgorithms(next === 'regression' ? ['ridge', 'random_forest'] : ['logistic', 'random_forest'])
           }}><option value="regression">回归</option><option value="classification">分类</option></select></label>
-          <label><span>目标字段</span><select value={targetField} onChange={(event) => setTargetField(event.target.value)}><option value="">选择目标</option>{dataset.data?.fields.map((field) =>
+          {!multiObjective && <label><span>目标字段</span><select value={targetField} onChange={(event) => setTargetField(event.target.value)}><option value="">选择目标</option>{dataset.data?.fields.map((field) =>
             <option value={field.id} key={field.id}>{field.display_name}</option>
-          )}</select></label>
+          )}</select></label>}
+          {taskType === 'regression' && <label className="ml-toggle"><span>多目标加权</span><input type="checkbox" checked={multiObjective} onChange={(event) => {
+            setMultiObjective(event.target.checked)
+            if (event.target.checked && !objectives.length && targetField) setObjectives([{ field_id: targetField, direction: 'maximize', weight: 1 }])
+          }} /></label>}
         </div>
+        {multiObjective && <div className="objective-editor">
+          <div className="objective-hint">按方向与权重合成单一优化目标；数值以训练集范围归一化，绝不纳入测试集（防泄漏）。</div>
+          {objectives.map((objective, position) =>
+            <div className="objective-row" key={position}>
+              <select value={objective.field_id} onChange={(event) => setObjectives((current) => current.map((item, index) => index === position ? { ...item, field_id: event.target.value } : item))}>
+                <option value="">选择目标字段</option>{dataset.data?.fields.map((field) =>
+                  <option value={field.id} key={field.id}>{field.display_name}</option>)}
+              </select>
+              <select value={objective.direction} onChange={(event) => setObjectives((current) => current.map((item, index) => index === position ? { ...item, direction: event.target.value as 'maximize' | 'minimize' } : item))}>
+                <option value="maximize">越大越好</option><option value="minimize">越小越好</option>
+              </select>
+              <input type="number" min={0.1} step={0.1} value={objective.weight} onChange={(event) => setObjectives((current) => current.map((item, index) => index === position ? { ...item, weight: Number(event.target.value) } : item))} />
+              <button className="button button-ghost" type="button" onClick={() => setObjectives((current) => current.filter((_, index) => index !== position))}>删除</button>
+            </div>)}
+          <button className="button button-secondary" type="button" onClick={() => setObjectives((current) => [...current, { field_id: '', direction: 'maximize', weight: 1 }])}>+ 添加目标</button>
+        </div>}
         <div className="field-choice-grid">
-          <div><span>输入字段</span>{dataset.data?.fields.filter((field) => field.id !== targetField).map((field) =>
+          <div><span>输入字段</span>{dataset.data?.fields.filter((field) => multiObjective ? !objectives.some((objective) => objective.field_id === field.id) : field.id !== targetField).map((field) =>
             <label key={field.id}><input type="checkbox" checked={inputFields.includes(field.id)} onChange={() => setInputFields((current) =>
               current.includes(field.id) ? current.filter((id) => id !== field.id) : [...current, field.id]
             )} /> {field.display_name}</label>
@@ -3567,7 +3592,7 @@ function MLSection({ projectId }: { projectId: string }) {
           </select></label>
         </div>
         <div className="editor-actions">
-          <button className="button button-primary" disabled={!canWrite || !runName || !datasetVersionId || !targetField || !inputFields.length || !algorithms.length || createRun.isPending} onClick={() => createRun.mutate()}>
+          <button className="button button-primary" disabled={!canWrite || !runName || !datasetVersionId || (multiObjective ? objectives.filter((item) => item.field_id).length < 2 : !targetField) || !inputFields.length || !algorithms.length || createRun.isPending} onClick={() => createRun.mutate()}>
             <BrainCircuit size={15} /> 开始训练
           </button>
         </div>

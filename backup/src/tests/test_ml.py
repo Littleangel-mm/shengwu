@@ -174,6 +174,37 @@ def test_compose_objective_uses_train_only_scale_and_directions() -> None:
     assert composite_test.iloc[0] == pytest.approx(1.0)
 
 
+def test_compute_derived_features_supports_common_ops() -> None:
+    frame = pd.DataFrame({"temp": [20.0, 30.0], "time": [2.0, 0.0]})
+    specs = [
+        {"key": "temp__over__time", "op": "ratio", "operands": ["temp", "time"]},
+        {"key": "temp__x__time", "op": "product", "operands": ["temp", "time"]},
+        {"key": "temp__minus__time", "op": "difference", "operands": ["temp", "time"]},
+        {"key": "temp__plus__time", "op": "sum", "operands": ["temp", "time"]},
+    ]
+    result = MLService._compute_derived_features(frame, specs)
+    assert result["temp__over__time"].iloc[0] == pytest.approx(10.0)
+    # 除零安全：分母为 0 → NaN，不抛异常。
+    assert np.isnan(result["temp__over__time"].iloc[1])
+    assert result["temp__x__time"].iloc[0] == pytest.approx(40.0)
+    assert result["temp__minus__time"].iloc[0] == pytest.approx(18.0)
+    assert result["temp__plus__time"].iloc[0] == pytest.approx(22.0)
+
+
+def test_compute_derived_features_skips_missing_operands() -> None:
+    frame = pd.DataFrame({"a": [1.0, 2.0]})
+    specs = [{"key": "a__over__b", "op": "ratio", "operands": ["a", "b"]}]
+    result = MLService._compute_derived_features(frame, specs)
+    assert "a__over__b" not in result.columns
+
+
+def test_derived_feature_spec_requires_two_operands_for_ratio() -> None:
+    from app.schemas.ml import DerivedFeatureSpec
+
+    with pytest.raises(ValidationError):
+        DerivedFeatureSpec(key="bad", op="ratio", operands=["a", "b", "c"])
+
+
 def test_cross_validate_returns_out_of_fold_predictions_for_every_row() -> None:
     from sklearn.linear_model import Ridge
     from sklearn.model_selection import KFold

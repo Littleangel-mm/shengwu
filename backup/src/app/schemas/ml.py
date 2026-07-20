@@ -83,6 +83,22 @@ class TargetObjective(BaseModel):
     weight: float = Field(default=1.0, gt=0, le=100)
 
 
+DerivedFeatureOp = Literal["ratio", "product", "difference", "sum"]
+
+
+class DerivedFeatureSpec(BaseModel):
+    key: str = Field(min_length=1, max_length=120)
+    label: str | None = Field(default=None, max_length=200)
+    op: DerivedFeatureOp
+    operands: list[str] = Field(min_length=2, max_length=6)
+
+    @model_validator(mode="after")
+    def validate_operands(self) -> "DerivedFeatureSpec":
+        if self.op in ("ratio", "difference") and len(self.operands) != 2:
+            raise ValueError("比值/差值派生特征需要且仅需要两个操作数")
+        return self
+
+
 class MLRunCreate(BaseModel):
     name: str = Field(min_length=1, max_length=240)
     dataset_version_id: UUID
@@ -90,6 +106,7 @@ class MLRunCreate(BaseModel):
     input_field_ids: list[UUID] = Field(min_length=1, max_length=200)
     target_field_id: UUID | None = None
     targets: list[TargetObjective] | None = Field(default=None, max_length=20)
+    derived_features: list[DerivedFeatureSpec] | None = Field(default=None, max_length=50)
     algorithms: list[MLAlgorithm] = Field(
         default_factory=_default_algorithms,
         min_length=1,

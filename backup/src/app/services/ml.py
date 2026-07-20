@@ -158,6 +158,15 @@ class MLService:
                     "parameter_search": payload.parameter_search,
                     "explain": payload.explain,
                     "objectives": objectives,
+                    "derived_features": [
+                        {
+                            "key": spec.key,
+                            "label": spec.label,
+                            "op": spec.op,
+                            "operands": spec.operands,
+                        }
+                        for spec in (payload.derived_features or [])
+                    ],
                 },
                 augmentation_config={
                     "enabled": payload.augmentation_enabled,
@@ -555,6 +564,102 @@ class MLService:
             count,
         )
 
+    NUMERIC_DATA_TYPES = {"number", "integer", "float", "decimal"}
+
+    @classmethod
+    def _compute_derived_features(
+        cls, frame: pd.DataFrame, specs: list[dict[str, Any]]
+    ) -> pd.DataFrame:
+        """从原始输入列实时计算派生特征列；训练/预测/优化共用，保证一致且无泄漏。"""
+        if not specs:
+            return frame
+        result = frame.copy()
+        for spec in specs:
+            key = spec.get("key")
+            op = spec.get("op")
+            operands = spec.get("operands") or []
+            if not key or not op or any(name not in result.columns for name in operands):
+                continue
+            columns = [pd.to_numeric(result[name], errors="coerce") for name in operands]
+            if op == "ratio":
+                denominator = columns[1].replace(0, np.nan)
+                result[key] = columns[0] / denominator
+            elif op == "product":
+                value = columns[0].copy()
+                for column in columns[1:]:
+                    value = value * column
+                result[key] = value
+            elif op == "difference":
+                result[key] = columns[0] - columns[1]
+            elif op == "sum":
+                value = columns[0].copy()
+                for column in columns[1:]:
+                    value = value + column
+                result[key] = value
+        return result
+
+    def suggest_derived_features(
+        self, project_id: UUID, dataset_version_id: UUID
+    ) -> list[dict[str, Any]]:
+        versions = table(self.db, "dataset_versions")
+        datasets = table(self.db, "datasets")
+        fields = table(self.db, "dataset_fields")
+        version = (
+            self.db.execute(
+                select(versions.c.id)
+                .join(datasets, datasets.c.id == versions.c.dataset_id)
+                .where(
+                    versions.c.id == dataset_version_id,
+                    datasets.c.project_id == project_id,
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if not version:
+            raise AppError(
+                code="dataset_version_not_found", message="数据集版本不存在", status_code=404
+            )
+        numeric_fields = [
+            dict(row)
+            for row in self.db.execute(
+                select(fields.c.field_key, fields.c.display_name, fields.c.data_type)
+                .where(
+                    fields.c.dataset_version_id == dataset_version_id,
+                    fields.c.data_type.in_(self.NUMERIC_DATA_TYPES),
+                    fields.c.semantic_role != "identifier",
+                )
+                .order_by(fields.c.position)
+            ).mappings()
+        ]
+        labels = {row["field_key"]: (row["display_name"] or row["field_key"]) for row in numeric_fields}
+        keys = [row["field_key"] for row in numeric_fields]
+        suggestions: list[dict[str, Any]] = []
+        # 成对派生：比值与乘积（"积温类"即温度×时间等乘积的一般化）。为避免爆炸，限定对数上限。
+        max_pairs = 40
+        for i in range(len(keys)):
+            for j in range(i + 1, len(keys)):
+                if len(suggestions) >= max_pairs * 2:
+                    break
+                a, b = keys[i], keys[j]
+                suggestions.append(
+                    {
+                        "key": f"{a}__over__{b}",
+                        "label": f"{labels[a]} / {labels[b]}（比值）",
+                        "op": "ratio",
+                        "operands": [a, b],
+                    }
+                )
+                suggestions.append(
+                    {
+                        "key": f"{a}__x__{b}",
+                        "label": f"{labels[a]} × {labels[b]}（乘积/积温类）",
+                        "op": "product",
+                        "operands": [a, b],
+                    }
+                )
+        return suggestions
+
     @staticmethod
     def _normalize_objective(
         series: pd.Series, vmin: float, vmax: float, direction: str
@@ -738,6 +843,17 @@ class MLService:
             str(field_id): key
             for field_id, key in zip(target_ids, target_keys, strict=False)
         }
+        raw_input_keys = list(X.columns)
+        derived_specs = [
+            spec
+            for spec in (config.get("derived_features") or [])
+            if spec.get("key")
+            and all(name in raw_input_keys for name in (spec.get("operands") or []))
+        ]
+        if derived_specs:
+            X = self._compute_derived_features(X, derived_specs)
+            for spec in derived_specs:
+                input_types[spec["key"]] = "number"
         if len(X) < 4:
             raise AppError(
                 code="insufficient_samples",
@@ -921,6 +1037,8 @@ class MLService:
                 "task_type": run["task_type"],
                 "dataset_version_id": str(run["dataset_version_id"]),
                 "target_classes": label_encoder.classes_.tolist() if label_encoder else None,
+                "raw_input_keys": raw_input_keys,
+                "derived_features": derived_specs,
                 "is_composite_objective": is_multi_objective,
                 "objectives": objective_stats,
                 "residual_std": (
@@ -1329,6 +1447,7 @@ class MLService:
         artifact: dict[str, Any], frame: pd.DataFrame
     ) -> tuple[np.ndarray, list[dict[str, Any]]]:
         pipeline = artifact["pipeline"]
+        frame = MLService._compute_derived_features(frame, artifact.get("derived_features") or [])
         predictions = np.asarray(pipeline.predict(frame)).reshape(-1)
         estimator = pipeline.named_steps["model"]
         uncertainties: list[dict[str, Any]] = []
@@ -1377,7 +1496,8 @@ class MLService:
 
     def predict(self, project_id: UUID, model_id: UUID, payload: PredictionRequest) -> dict:
         model, artifact = self._load_model(project_id, model_id)
-        missing = [key for key in artifact["input_keys"] if key not in payload.values]
+        raw_keys = artifact.get("raw_input_keys") or artifact["input_keys"]
+        missing = [key for key in raw_keys if key not in payload.values]
         if missing:
             raise AppError(
                 code="missing_prediction_inputs",
@@ -1385,7 +1505,7 @@ class MLService:
                 status_code=422,
                 details=missing,
             )
-        frame = pd.DataFrame([{key: payload.values[key] for key in artifact["input_keys"]}])
+        frame = pd.DataFrame([{key: payload.values[key] for key in raw_keys}])
         predictions, uncertainties = self._predict_with_uncertainty(artifact, frame)
         prediction = predictions[0]
         value = prediction.item() if hasattr(prediction, "item") else prediction
@@ -1472,8 +1592,9 @@ class MLService:
         if not run:
             raise AppError(code="optimization_not_found", message="优化任务不存在", status_code=404)
         _, artifact = self._load_model(run["project_id"], run["ml_model_id"])
+        raw_keys = artifact.get("raw_input_keys") or artifact["input_keys"]
         constraints = run["constraint_config"] or {}
-        missing = [key for key in artifact["input_keys"] if key not in constraints]
+        missing = [key for key in raw_keys if key not in constraints]
         if missing:
             raise AppError(
                 code="optimization_constraints_missing",
@@ -1485,7 +1606,7 @@ class MLService:
         sample_count = int(config.get("sample_count", 3000))
         rng = np.random.default_rng(int(config.get("random_seed", 42)))
         data = {}
-        for key in artifact["input_keys"]:
+        for key in raw_keys:
             rule = constraints[key]
             if "values" in rule:
                 data[key] = rng.choice(rule["values"], size=sample_count)
@@ -1512,7 +1633,7 @@ class MLService:
                 key: frame.iloc[int(idx)][key].item()
                 if hasattr(frame.iloc[int(idx)][key], "item")
                 else frame.iloc[int(idx)][key]
-                for key in artifact["input_keys"]
+                for key in raw_keys
             }
             pred = predicted[int(idx)]
             rows.append(

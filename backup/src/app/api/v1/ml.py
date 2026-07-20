@@ -27,6 +27,14 @@ def create_ml_run(project_id: UUID, payload: MLRunCreate, db: DbSession, actor_i
     return service(db).create_run(project_id, payload, actor_id)
 
 
+@router.get(
+    "/{project_id}/dataset-versions/{dataset_version_id}/derived-feature-candidates",
+    response_model=list[dict[str, Any]],
+)
+def suggest_derived_features(project_id: UUID, dataset_version_id: UUID, db: DbSession):
+    return service(db).suggest_derived_features(project_id, dataset_version_id)
+
+
 @router.get("/{project_id}/ml-runs", response_model=list[dict[str, Any]])
 def list_ml_runs(project_id: UUID, db: DbSession):
     return service(db).list_runs(project_id)

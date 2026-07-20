@@ -961,6 +961,10 @@ export const api = {
       `/projects/${projectId}/dataset-versions/${versionId}/export.xlsx`,
       `${name || 'dataset'}.xlsx`,
     ),
+  derivedFeatureCandidates: (projectId: string, datasetVersionId: string) =>
+    request<{ key: string; label: string; op: string; operands: string[] }[]>(
+      `/projects/${projectId}/dataset-versions/${datasetVersionId}/derived-feature-candidates`,
+    ),
   mlRuns: (projectId: string) =>
     request<MLRun[]>(`/projects/${projectId}/ml-runs`),
   mlRun: (projectId: string, runId: string) =>
@@ -974,6 +978,7 @@ export const api = {
       input_field_ids: string[]
       target_field_id?: string
       targets?: { field_id: string; direction: 'maximize' | 'minimize'; weight: number }[]
+      derived_features?: { key: string; label?: string; op: string; operands: string[] }[]
       algorithms: string[]
       random_seed: number
       test_size: number

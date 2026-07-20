@@ -3393,6 +3393,7 @@ function MLSection({ projectId }: { projectId: string }) {
   const [cvStrategy, setCvStrategy] = useState<'group_kfold' | 'leave_one_group_out' | 'kfold'>('group_kfold')
   const [multiObjective, setMultiObjective] = useState(false)
   const [objectives, setObjectives] = useState<{ field_id: string; direction: 'maximize' | 'minimize'; weight: number }[]>([])
+  const [derivedKeys, setDerivedKeys] = useState<string[]>([])
   const [selectedRunId, setSelectedRunId] = useState('')
   const [predictionValues, setPredictionValues] = useState('{}')
   const [predictionResult, setPredictionResult] = useState<unknown>(null)
@@ -3406,6 +3407,11 @@ function MLSection({ projectId }: { projectId: string }) {
   const dataset = useQuery({
     queryKey: ['dataset-version', projectId, datasetVersionId],
     queryFn: () => api.datasetVersion(projectId, datasetVersionId),
+    enabled: Boolean(datasetVersionId),
+  })
+  const derivedCandidates = useQuery({
+    queryKey: ['derived-candidates', projectId, datasetVersionId],
+    queryFn: () => api.derivedFeatureCandidates(projectId, datasetVersionId),
     enabled: Boolean(datasetVersionId),
   })
   const runs = useQuery({
@@ -3448,6 +3454,7 @@ function MLSection({ projectId }: { projectId: string }) {
         ...(multiObjective
           ? { targets: objectives.filter((item) => item.field_id) }
           : { target_field_id: targetField }),
+        derived_features: (derivedCandidates.data || []).filter((item) => derivedKeys.includes(item.key)),
         algorithms,
         random_seed: 42,
         test_size: 0.2,
@@ -3538,7 +3545,7 @@ function MLSection({ projectId }: { projectId: string }) {
         <div className="ml-config-grid">
           <label><span>运行名称</span><input value={runName} onChange={(event) => setRunName(event.target.value)} placeholder="产率预测模型" /></label>
           <label><span>冻结数据集</span><select value={datasetVersionId} onChange={(event) => {
-            setDatasetVersionId(event.target.value); setInputFields([]); setTargetField('')
+            setDatasetVersionId(event.target.value); setInputFields([]); setTargetField(''); setDerivedKeys([])
           }}><option value="">选择版本</option>{datasets.data?.filter((item) => item.latest_version_status === 'frozen').map((item) =>
             <option value={item.latest_version_id} key={item.id}>{item.name} · V{item.latest_version_no}</option>
           )}</select></label>
@@ -3591,6 +3598,14 @@ function MLSection({ projectId }: { projectId: string }) {
             <option value="kfold">普通 K 折（KFold）</option>
           </select></label>
         </div>
+        {taskType === 'regression' && Boolean(derivedCandidates.data?.length) && <div className="derived-editor">
+          <div className="objective-hint">派生特征（比值/乘积等）从原始输入实时计算，训练与预测一致、无需写公式，勾选即加入建模。</div>
+          <div className="derived-grid">{derivedCandidates.data?.map((candidate) =>
+            <label key={candidate.key}><input type="checkbox" checked={derivedKeys.includes(candidate.key)} onChange={() => setDerivedKeys((current) =>
+              current.includes(candidate.key) ? current.filter((item) => item !== candidate.key) : [...current, candidate.key]
+            )} /> {candidate.label}</label>)}
+          </div>
+        </div>}
         <div className="editor-actions">
           <button className="button button-primary" disabled={!canWrite || !runName || !datasetVersionId || (multiObjective ? objectives.filter((item) => item.field_id).length < 2 : !targetField) || !inputFields.length || !algorithms.length || createRun.isPending} onClick={() => createRun.mutate()}>
             <BrainCircuit size={15} /> 开始训练

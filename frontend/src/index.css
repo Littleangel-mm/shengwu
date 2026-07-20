@@ -3050,6 +3050,28 @@ select option {
   width: 100%;
 }
 
+.derived-editor {
+  margin-top: 18px;
+  padding: 16px;
+  border: 1px solid rgba(198, 168, 106, 0.28);
+  border-radius: 14px;
+  background: rgba(198, 168, 106, 0.05);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.derived-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+}
+
+.derived-grid label {
+  color: var(--text-soft);
+  font-size: 13px;
+}
+
 .field-choice-grid > div {
   display: flex;
   flex-wrap: wrap;

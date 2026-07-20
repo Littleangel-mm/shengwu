@@ -57,6 +57,16 @@ def update_project(
     return ProjectService(db).update(project_id, payload)
 
 
+@router.post("/{project_id}/archive", response_model=ProjectResponse)
+def archive_project(project_id: UUID, db: DbSession, admin: ProjectAdmin) -> ProjectResponse:
+    return ProjectService(db).archive(project_id, admin)
+
+
+@router.post("/{project_id}/unarchive", response_model=ProjectResponse)
+def unarchive_project(project_id: UUID, db: DbSession, admin: ProjectAdmin) -> ProjectResponse:
+    return ProjectService(db).unarchive(project_id, admin)
+
+
 @router.delete("/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_project(project_id: UUID, db: DbSession, _editor: ProjectEditor) -> Response:
     ProjectService(db).soft_delete(project_id)

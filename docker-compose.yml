@@ -1,0 +1,91 @@
+# 容器化部署编排。
+# 密钥通过根目录 .env 注入（DB_PASSWORD、APP_SECRET 等），不要把真实值写进本文件。
+# PaddleOCR 模型目录 backup/src/models/paddleocr 以只读卷挂载，不打进镜像。
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-research_app}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?请在 .env 中设置 DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME:-research_platform}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-research_app} -d ${DB_NAME:-research_platform}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  api:
+    build: ./backup/src
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # 启动前执行数据库迁移（alembic.ini 与 migrations 已复制进镜像工作目录 /srv/app）
+    command: sh -c "python -m alembic upgrade head && python -m app"
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      APP_HOST: 0.0.0.0
+      APP_PORT: "8000"
+      APP_RELOAD: "false"
+      APP_SECRET: ${APP_SECRET:?请在 .env 中设置 APP_SECRET}
+      ALLOW_ACTOR_HEADER: "false"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: ${DB_USER:-research_app}
+      DB_PASSWORD: ${DB_PASSWORD:?请在 .env 中设置 DB_PASSWORD}
+      DB_NAME: ${DB_NAME:-research_platform}
+      STORAGE_ROOT: /srv/app/data
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://127.0.0.1:8080,http://localhost:8080}
+      OCR_ENABLED: ${OCR_ENABLED:-false}
+      OCR_DETECTION_MODEL_DIR: /srv/app/models/paddleocr/PP-OCRv5_mobile_det
+      OCR_RECOGNITION_MODEL_DIR: /srv/app/models/paddleocr/PP-OCRv5_mobile_rec
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+    volumes:
+      - ./backup/src/models:/srv/app/models:ro
+      - api-data:/srv/app/data
+    expose:
+      - "8000"
+
+  worker:
+    build: ./backup/src
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_started
+    command: python -m app.worker
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      APP_SECRET: ${APP_SECRET:?请在 .env 中设置 APP_SECRET}
+      ALLOW_ACTOR_HEADER: "false"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: ${DB_USER:-research_app}
+      DB_PASSWORD: ${DB_PASSWORD:?请在 .env 中设置 DB_PASSWORD}
+      DB_NAME: ${DB_NAME:-research_platform}
+      STORAGE_ROOT: /srv/app/data
+      OCR_ENABLED: ${OCR_ENABLED:-false}
+      OCR_DETECTION_MODEL_DIR: /srv/app/models/paddleocr/PP-OCRv5_mobile_det
+      OCR_RECOGNITION_MODEL_DIR: /srv/app/models/paddleocr/PP-OCRv5_mobile_rec
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+    volumes:
+      - ./backup/src/models:/srv/app/models:ro
+      - api-data:/srv/app/data
+
+  web:
+    build: ./frontend
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "8080:80"
+
+volumes:
+  postgres-data:
+  api-data:

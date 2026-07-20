@@ -138,6 +138,51 @@ class ProjectService:
         self.db.refresh(project)
         return ProjectResponse.model_validate(project)
 
+    def archive(self, project_id: UUID, actor_id: UUID) -> ProjectResponse:
+        project = self._get_model(project_id)
+        if project.status != "archived":
+            archived_at = datetime.now(UTC)
+            before = {
+                "status": project.status,
+                "archived_at": project.archived_at.isoformat() if project.archived_at else None,
+            }
+            project.status = "archived"
+            project.archived_at = archived_at
+            AuditService(self.db).record(
+                project_id=project_id,
+                actor_id=actor_id,
+                entity_type="project",
+                entity_id=project_id,
+                action="project.archived",
+                before=before,
+                after={"status": "archived", "archived_at": archived_at.isoformat()},
+            )
+            self.db.commit()
+            self.db.refresh(project)
+        return ProjectResponse.model_validate(project)
+
+    def unarchive(self, project_id: UUID, actor_id: UUID) -> ProjectResponse:
+        project = self._get_model(project_id)
+        if project.status == "archived":
+            before = {
+                "status": project.status,
+                "archived_at": project.archived_at.isoformat() if project.archived_at else None,
+            }
+            project.status = "active"
+            project.archived_at = None
+            AuditService(self.db).record(
+                project_id=project_id,
+                actor_id=actor_id,
+                entity_type="project",
+                entity_id=project_id,
+                action="project.unarchived",
+                before=before,
+                after={"status": "active", "archived_at": None},
+            )
+            self.db.commit()
+            self.db.refresh(project)
+        return ProjectResponse.model_validate(project)
+
     def soft_delete(self, project_id: UUID) -> None:
         project = self._get_model(project_id)
         project.status = "deleted"

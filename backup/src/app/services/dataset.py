@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 from collections import defaultdict
 from collections.abc import Callable
 from datetime import date
@@ -9,7 +10,8 @@ from uuid import UUID
 
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
-from sqlalchemy import delete, func, insert, select, update
+from openpyxl.worksheet.worksheet import Worksheet
+from sqlalchemy import delete, func, insert, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -194,6 +196,125 @@ def _freeze_snapshot(
             )
         ],
     }
+
+
+EXPORT_MISSING = "——"
+BASE_EXPORT_COLUMNS = (
+    "来源文件名",
+    "篇名",
+    "出版时间",
+    "出版物名称",
+    "品种/处理组",
+    "地点/材料",
+    "时间点",
+    "证据状态",
+)
+
+_EXPORT_HEADER_FONT = Font(bold=True, color="FFFFFF")
+_EXPORT_HEADER_FILL = PatternFill("solid", fgColor="305496")
+
+
+def _style_export_header(sheet: Worksheet) -> None:
+    for cell in sheet[1]:
+        cell.font = _EXPORT_HEADER_FONT
+        cell.fill = _EXPORT_HEADER_FILL
+
+
+def _sample_key_value(sample_key: Any, key: str) -> str | None:
+    if not sample_key:
+        return None
+    match = re.search(rf"{key}=([^:]+)", str(sample_key))
+    return match.group(1) if match else None
+
+
+def _publication_time(document: dict[str, Any] | None) -> str:
+    if not document:
+        return EXPORT_MISSING
+    if document.get("publication_date"):
+        return str(document["publication_date"])
+    if document.get("publication_year"):
+        return str(document["publication_year"])
+    return EXPORT_MISSING
+
+
+def _metadata_value(metadata: Any, *keys: str) -> str | None:
+    if isinstance(metadata, dict):
+        for key in keys:
+            value = metadata.get(key)
+            if value:
+                return str(value)
+    return None
+
+
+def _base_row_values(
+    row: dict[str, Any], document: dict[str, Any] | None, filename: str | None
+) -> list[Any]:
+    row_metadata = row.get("metadata") or {}
+    document_metadata = (document or {}).get("metadata")
+    treatment = (
+        _metadata_value(row_metadata, "treatment", "variety")
+        or _sample_key_value(row.get("source_sample_key"), "treatment")
+        or _metadata_value(document_metadata, "variety", "treatment")
+        or EXPORT_MISSING
+    )
+    location = (
+        _metadata_value(document_metadata, "location", "material")
+        or _metadata_value(row_metadata, "location", "material")
+        or EXPORT_MISSING
+    )
+    timepoint = (
+        _metadata_value(row_metadata, "timepoint")
+        or _sample_key_value(row.get("source_sample_key"), "time")
+        or EXPORT_MISSING
+    )
+    return [
+        filename or EXPORT_MISSING,
+        (document or {}).get("title") or EXPORT_MISSING,
+        _publication_time(document),
+        (document or {}).get("publication_name") or EXPORT_MISSING,
+        treatment,
+        location,
+        timepoint,
+        row.get("review_status") or EXPORT_MISSING,
+    ]
+
+
+def _raw_cell_value(cell: dict[str, Any] | None) -> Any:
+    if not cell:
+        return EXPORT_MISSING
+    if cell.get("raw_value") is not None:
+        return cell["raw_value"]
+    if cell.get("value_number") is not None:
+        return cell["value_number"]
+    return cell.get("value_text") or EXPORT_MISSING
+
+
+def _ml_cell_value(cell: dict[str, Any] | None) -> Any:
+    if not cell:
+        return ""
+    if cell.get("value_number") is not None:
+        return cell["value_number"]
+    if cell.get("value_boolean") is not None:
+        return cell["value_boolean"]
+    if cell.get("value_date") is not None:
+        return str(cell["value_date"])
+    if cell.get("value_text"):
+        return cell["value_text"]
+    for column in ("normalized_value", "ml_value"):
+        value = cell.get(column)
+        if isinstance(value, dict) and value:
+            if "value" in value:
+                return value["value"]
+            return json.dumps(value, ensure_ascii=False, default=str)
+    return ""
+
+
+def _json_cell(value: Any) -> str:
+    if value in (None, "", {}, []):
+        return ""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, default=str)
+    return str(value)
 
 
 class DatasetService:
@@ -1026,34 +1147,134 @@ class DatasetService:
             "field_count": len(field_rows),
         }
 
+    def _export_document_context(
+        self, rows: list[dict[str, Any]]
+    ) -> tuple[dict[UUID, dict[str, Any]], dict[UUID, str]]:
+        document_ids = {
+            row["source_document_id"] for row in rows if row.get("source_document_id")
+        }
+        version_ids = {
+            row["source_document_version_id"]
+            for row in rows
+            if row.get("source_document_version_id")
+        }
+        documents_by_id: dict[UUID, dict[str, Any]] = {}
+        if document_ids:
+            documents = table(self.db, "documents")
+            for document in self.db.execute(
+                select(documents).where(documents.c.id.in_(document_ids))
+            ).mappings():
+                documents_by_id[document["id"]] = dict(document)
+        filename_by_version: dict[UUID, str] = {}
+        if version_ids:
+            document_versions = table(self.db, "document_versions")
+            stored_files = table(self.db, "stored_files")
+            for version_id, original_name in self.db.execute(
+                select(document_versions.c.id, stored_files.c.original_name)
+                .join(stored_files, stored_files.c.id == document_versions.c.source_file_id)
+                .where(document_versions.c.id.in_(version_ids))
+            ):
+                if original_name:
+                    filename_by_version[version_id] = original_name
+        return documents_by_id, filename_by_version
+
     def export_xlsx(self, project_id: UUID, version_id: UUID) -> Path:
         dataset_data, version_data = self._version_context(project_id, version_id)
         content = self.get_version(
             project_id, version_id, 0, max(int(version_data["row_count"] or 0), 1_000_000)
         )
-        workbook = Workbook()
-        sheet = workbook.active
-        sheet.title = "dataset_main"
         fields = content["fields"]
-        sheet.append([field["display_name"] for field in fields])
-        for cell in sheet[1]:
-            cell.font = Font(bold=True, color="FFFFFF")
-            cell.fill = PatternFill("solid", fgColor="305496")
-        for row in content["rows"]:
-            values = []
+        rows = content["rows"]
+        documents_by_id, filename_by_version = self._export_document_context(rows)
+        field_headers = [field["display_name"] for field in fields]
+
+        workbook = Workbook()
+        main_sheet = workbook.active
+        main_sheet.title = "dataset_main"
+        main_sheet.append([*BASE_EXPORT_COLUMNS, *field_headers])
+        _style_export_header(main_sheet)
+
+        ml_sheet = workbook.create_sheet("dataset_ml")
+        ml_sheet.append([*BASE_EXPORT_COLUMNS, *field_headers])
+        _style_export_header(ml_sheet)
+
+        for row in rows:
+            document = documents_by_id.get(row.get("source_document_id"))
+            filename = filename_by_version.get(row.get("source_document_version_id"))
+            base_values = _base_row_values(row, document, filename)
+            main_values = list(base_values)
+            ml_values = list(base_values)
             for field in fields:
                 cell = row["cells"].get(field["field_key"])
-                if not cell:
-                    values.append("——")
-                elif cell["raw_value"] is not None:
-                    values.append(cell["raw_value"])
-                elif cell["value_number"] is not None:
-                    values.append(cell["value_number"])
-                else:
-                    values.append(cell["value_text"] or "——")
-            sheet.append(values)
-        trace = workbook.create_sheet("traceability")
-        trace.append(["row_key", "field_key", "raw_value", "page_no", "evidence_text"])
+                main_values.append(_raw_cell_value(cell))
+                ml_values.append(_ml_cell_value(cell))
+            main_sheet.append(main_values)
+            ml_sheet.append(ml_values)
+
+        self._write_token_dictionary(workbook.create_sheet("token_dictionary"), project_id)
+        self._write_traceability(workbook.create_sheet("traceability"), version_id)
+        self._write_conversion_records(workbook.create_sheet("conversion_records"), project_id)
+        self._write_audit_log(workbook.create_sheet("audit_log"), project_id)
+
+        output_dir = self.storage.path_for_key(f"exports/{project_id}")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output = output_dir / f"dataset-{dataset_data['id']}-v{version_data['version_no']}.xlsx"
+        workbook.save(output)
+        return output
+
+    def _write_token_dictionary(self, sheet: Worksheet, project_id: UUID) -> None:
+        sheet.append(["标准名", "类别", "别名", "首选单位", "状态"])
+        _style_export_header(sheet)
+        terms = table(self.db, "terms")
+        categories = table(self.db, "term_categories")
+        aliases = table(self.db, "term_aliases")
+        units = table(self.db, "units")
+        term_rows = (
+            self.db.execute(
+                select(
+                    terms.c.id,
+                    terms.c.canonical_name,
+                    terms.c.status,
+                    categories.c.name.label("category_name"),
+                    units.c.symbol.label("unit_symbol"),
+                )
+                .select_from(terms)
+                .join(categories, categories.c.id == terms.c.category_id, isouter=True)
+                .join(units, units.c.id == terms.c.preferred_unit_id, isouter=True)
+                .where(
+                    terms.c.project_id == project_id,
+                    terms.c.deleted_at.is_(None),
+                    or_(terms.c.status == "confirmed", terms.c.is_selected.is_(True)),
+                )
+                .order_by(terms.c.canonical_name)
+            )
+            .mappings()
+            .all()
+        )
+        if not term_rows:
+            return
+        alias_map: dict[UUID, list[str]] = defaultdict(list)
+        for term_id, alias_text in self.db.execute(
+            select(aliases.c.term_id, aliases.c.alias_text)
+            .where(aliases.c.term_id.in_([row["id"] for row in term_rows]))
+            .order_by(aliases.c.alias_text)
+        ):
+            if alias_text:
+                alias_map[term_id].append(str(alias_text))
+        for row in term_rows:
+            sheet.append(
+                [
+                    row["canonical_name"],
+                    row["category_name"] or EXPORT_MISSING,
+                    "、".join(alias_map.get(row["id"], [])) or EXPORT_MISSING,
+                    row["unit_symbol"] or EXPORT_MISSING,
+                    row["status"] or EXPORT_MISSING,
+                ]
+            )
+
+    def _write_traceability(self, sheet: Worksheet, version_id: UUID) -> None:
+        sheet.append(["row_key", "field_key", "raw_value", "page_no", "evidence_text"])
+        _style_export_header(sheet)
         evidence_table = table(self.db, "dataset_cell_evidence")
         cells = table(self.db, "dataset_cells")
         rows_table = table(self.db, "dataset_rows")
@@ -1074,9 +1295,67 @@ class DatasetService:
             .where(rows_table.c.dataset_version_id == version_id)
         ).all()
         for row in trace_rows:
-            trace.append(list(row))
-        output_dir = self.storage.path_for_key(f"exports/{project_id}")
-        output_dir.mkdir(parents=True, exist_ok=True)
-        output = output_dir / f"dataset-{dataset_data['id']}-v{version_data['version_no']}.xlsx"
-        workbook.save(output)
-        return output
+            sheet.append(list(row))
+
+    def _write_conversion_records(self, sheet: Worksheet, project_id: UUID) -> None:
+        sheet.append(["原值", "原单位", "标准值", "标准单位", "规则/公式", "状态", "时间"])
+        _style_export_header(sheet)
+        conversions = table(self.db, "conversion_records")
+        units = table(self.db, "units")
+        source_units = units.alias("source_units")
+        target_units = units.alias("target_units")
+        rows = self.db.execute(
+            select(
+                conversions,
+                source_units.c.symbol.label("source_symbol"),
+                target_units.c.symbol.label("target_symbol"),
+            )
+            .select_from(conversions)
+            .join(source_units, source_units.c.id == conversions.c.source_unit_id, isouter=True)
+            .join(target_units, target_units.c.id == conversions.c.target_unit_id, isouter=True)
+            .where(conversions.c.project_id == project_id)
+            .order_by(conversions.c.created_at)
+        ).mappings()
+        for row in rows:
+            record = dict(row)
+            sheet.append(
+                [
+                    _json_cell(record.get("source_value")),
+                    record.get("source_symbol") or record.get("source_unit_text") or EXPORT_MISSING,
+                    _json_cell(record.get("target_value")),
+                    record.get("target_symbol") or EXPORT_MISSING,
+                    record.get("formula_used") or EXPORT_MISSING,
+                    record.get("status") or EXPORT_MISSING,
+                    str(record.get("created_at")) if record.get("created_at") else EXPORT_MISSING,
+                ]
+            )
+
+    def _write_audit_log(self, sheet: Worksheet, project_id: UUID) -> None:
+        sheet.append(["时间", "操作", "对象类型", "对象ID", "执行人", "摘要"])
+        _style_export_header(sheet)
+        logs = table(self.db, "audit_logs")
+        users = table(self.db, "app_users")
+        rows = self.db.execute(
+            select(logs, users.c.display_name.label("actor_name"))
+            .select_from(logs)
+            .join(users, users.c.id == logs.c.actor_id, isouter=True)
+            .where(logs.c.project_id == project_id)
+            .order_by(logs.c.created_at.desc())
+            .limit(5000)
+        ).mappings()
+        for row in rows:
+            record = dict(row)
+            summary = record.get("reason") or _json_cell(record.get("after_value")) or ""
+            actor = record.get("actor_name") or (
+                str(record["actor_id"]) if record.get("actor_id") else EXPORT_MISSING
+            )
+            sheet.append(
+                [
+                    str(record.get("created_at")) if record.get("created_at") else EXPORT_MISSING,
+                    record.get("action") or EXPORT_MISSING,
+                    record.get("entity_type") or EXPORT_MISSING,
+                    str(record["entity_id"]) if record.get("entity_id") else EXPORT_MISSING,
+                    actor,
+                    summary,
+                ]
+            )

@@ -3,8 +3,9 @@ import zipfile
 from pathlib import Path, PurePosixPath
 from uuid import UUID
 
+import fitz
 from fastapi import UploadFile
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -318,6 +319,14 @@ class DocumentService:
                 .order_by(pages.c.page_no)
             ).mappings()
         ]
+        page_no_by_id: dict[UUID, int] = {}
+        for page_row in page_rows:
+            page_row["width"] = float(page_row["width"]) if page_row["width"] is not None else None
+            page_row["height"] = (
+                float(page_row["height"]) if page_row["height"] is not None else None
+            )
+            page_row["has_image"] = page_row.get("rendered_image_file_id") is not None
+            page_no_by_id[page_row["id"]] = page_row["page_no"]
         block_rows = [
             dict(row)
             for row in self.db.execute(
@@ -364,6 +373,8 @@ class DocumentService:
                 .order_by(figures.c.page_id, figures.c.figure_no)
             ).mappings()
         ]
+        for row_item in [*block_rows, *table_rows, *figure_rows]:
+            row_item["page_no"] = page_no_by_id.get(row_item["page_id"])
         return {
             "document": {
                 "id": document.id,
@@ -455,6 +466,113 @@ class DocumentService:
             f"{figure_no}.{stored.extension or 'png'}",
             stored.media_type,
         )
+
+    def page_image_path(
+        self, project_id: UUID, document_id: UUID, page_no: int
+    ) -> tuple[Path, str, str]:
+        project = self._project(project_id)
+        row = self.db.execute(
+            select(DocumentVersion, StoredFile)
+            .join(Document, Document.id == DocumentVersion.document_id)
+            .join(StoredFile, StoredFile.id == DocumentVersion.source_file_id)
+            .where(
+                Document.id == document_id,
+                Document.project_id == project_id,
+                Document.deleted_at.is_(None),
+            )
+            .order_by(DocumentVersion.version_no.desc())
+            .limit(1)
+        ).one_or_none()
+        if not row:
+            raise AppError(code="document_not_found", message="文献不存在", status_code=404)
+        version, source_file = row
+        pages = table(self.db, "document_pages")
+        page_row = (
+            self.db.execute(
+                select(pages).where(
+                    pages.c.document_version_id == version.id,
+                    pages.c.page_no == page_no,
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if not page_row:
+            raise AppError(code="page_not_found", message="文献页不存在", status_code=404)
+
+        rendered_file_id = page_row["rendered_image_file_id"]
+        if rendered_file_id:
+            rendered = self.db.get(StoredFile, rendered_file_id)
+            if rendered and rendered.deleted_at is None:
+                path = self.storage.path_for_key(rendered.storage_key)
+                if path.exists():
+                    return (
+                        path,
+                        f"page-{page_no}.{rendered.extension or 'png'}",
+                        rendered.media_type or "image/png",
+                    )
+
+        if (source_file.extension or "").lower() != "pdf":
+            raise AppError(
+                code="page_image_unavailable",
+                message="仅 PDF 文献支持页面图像渲染",
+                status_code=404,
+            )
+        source_path = self.storage.path_for_key(source_file.storage_key)
+        if not source_path.exists():
+            raise AppError(code="source_file_missing", message="原始文件不存在", status_code=409)
+
+        pdf = fitz.open(source_path)
+        try:
+            if page_no > len(pdf):
+                raise AppError(code="page_not_found", message="文献页不存在", status_code=404)
+            page = pdf[page_no - 1]
+            pixmap = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), alpha=False)
+            content = pixmap.tobytes("png")
+            page_width = round(float(page.rect.width), 3)
+            page_height = round(float(page.rect.height), 3)
+        finally:
+            pdf.close()
+
+        saved = self.storage.save_bytes(
+            project_id,
+            category="pages",
+            extension="png",
+            content=content,
+            media_type="image/png",
+        )
+        stored = StoredFile(
+            organization_id=project.organization_id,
+            project_id=project.id,
+            storage_provider="local",
+            storage_key=saved.storage_key,
+            original_name=f"page-{page_no}.png",
+            safe_name=saved.safe_name,
+            extension="png",
+            media_type="image/png",
+            byte_size=saved.byte_size,
+            sha256=saved.sha256,
+            purpose="page_render",
+            security_status="generated",
+            metadata_json={
+                "document_version_id": str(version.id),
+                "page_no": page_no,
+                "zoom": 2.0,
+            },
+        )
+        self.db.add(stored)
+        self.db.flush()
+        self.db.execute(
+            update(pages)
+            .where(pages.c.id == page_row["id"])
+            .values(
+                rendered_image_file_id=stored.id,
+                width=page_width,
+                height=page_height,
+            )
+        )
+        self.db.commit()
+        return saved.path, f"page-{page_no}.png", "image/png"
 
     def enqueue_reparse(
         self, project_id: UUID, document_id: UUID, actor_id: UUID | None

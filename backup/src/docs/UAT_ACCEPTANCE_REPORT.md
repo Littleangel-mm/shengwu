@@ -4,8 +4,8 @@
 
 系统：通用科研文献解析与机器学习平台后端
 
-状态：历史系统测试基线通过；本次开发预检工具通过，代码库全量回归遗留项待处理；
-客户业务验收与签字待执行
+状态：历史系统测试基线通过；本次开发预检工具通过，代码库全量回归（Ruff/Mypy/Pytest）
+已于 2026-07-19 晚间复跑通过；客户业务验收与签字待执行
 
 ## 第 18-20 天开发预检
 
@@ -21,14 +21,18 @@
 
 开发预检状态：**工具与模板已准备，客户金标准测试、真实 UAT、生产演练和三方签字待执行**。
 
-本次代码库验证记录：
+本次代码库验证记录（2026-07-19 晚间复跑）：
 
-- 新增工具 Ruff 检查、Mypy 脚本检查通过，金标准纯函数与合成 fixture 测试 `9 passed`。
-- 全量 Mypy 当前被既有 `app/services/dataset.py` 中未定义的 `conversions` 阻塞。
-- 全量 Ruff 被既有 `app/services/extraction.py` 中未定义的 `Project` 阻塞。
-- 全量 Pytest 为 `79 passed, 1 skipped, 2 failed`；失败位于既有
-  `tests/test_day16_backend.py` 的 DOCX 图片 fixture 和均值/标准差转换断言。
-- 上述全量遗留项不属于本次仅限脚本、文档和新增测试的修改范围，正式交付前仍须修复并重跑。
+- 全量 Ruff（`python -m ruff check app tests scripts`）通过，无问题。
+- 全量 Mypy（`python -m mypy app`）通过，检查 63 个源文件，无问题。
+- 全量 Pytest（`python -m pytest -q`）为 `100 passed, 1 skipped`；此前记录的
+  `dataset.py`/`extraction.py` 阻塞和 `test_day16_backend.py` 2 项失败均已修复。
+- 已提供容器化部署编排：`backup/src/Dockerfile`、`frontend/Dockerfile` 与根目录
+  `docker-compose.yml`（postgres/api/worker/web，启动时自动执行 Alembic 迁移），
+  详见运维指南“容器化部署”一节；本机无 Docker，编排文件仅经语法自查，未实际构建。
+- 已提供前端 Playwright 端到端验收脚本（`frontend/e2e/acceptance.spec.ts`，
+  覆盖落地页、注册建项、工作台导航三条流程）；因 chromium 二进制下载受限，
+  本次使用系统 Edge（Chromium 内核）实际执行，`3 passed`。
 
 ## 历史系统验收基线
 

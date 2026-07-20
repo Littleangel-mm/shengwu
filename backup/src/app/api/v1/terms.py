@@ -32,6 +32,14 @@ def list_categories(project_id: UUID, db: DbSession):
     return TermService(db).list_categories(project_id)
 
 
+@router.post(
+    "/{project_id}/term-categories/apply-default-template",
+    response_model=list[dict[str, Any]],
+)
+def apply_default_category_template(project_id: UUID, db: DbSession):
+    return TermService(db).apply_default_category_template(project_id)
+
+
 @router.patch("/{project_id}/term-categories/{category_id}", response_model=dict[str, Any])
 def update_category(
     project_id: UUID, category_id: UUID, payload: TermCategoryUpdate, db: DbSession
@@ -63,6 +71,12 @@ def list_terms(
         project_id, category_id, status, is_selected, offset, limit
     )
     return ListResponse(items=items, total=total, offset=offset, limit=limit)
+
+
+# 注意：必须先于 /terms/{term_id} 注册，否则 "synonym-suggestions" 会被当作 term_id 解析。
+@router.get("/{project_id}/terms/synonym-suggestions", response_model=list[dict[str, Any]])
+def suggest_term_synonyms(project_id: UUID, db: DbSession):
+    return TermService(db).suggest_synonyms(project_id)
 
 
 @router.get("/{project_id}/terms/{term_id}", response_model=dict[str, Any])

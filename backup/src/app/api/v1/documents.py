@@ -68,6 +68,19 @@ def download_figure(
     return FileResponse(path, filename=filename, media_type=media_type)
 
 
+@router.get("/{project_id}/documents/{document_id}/pages/{page_no}/image")
+def download_page_image(
+    project_id: UUID,
+    document_id: UUID,
+    page_no: int,
+    db: DbSession,
+):
+    path, filename, media_type = DocumentService(
+        db, LocalStorage(get_settings())
+    ).page_image_path(project_id, document_id, page_no)
+    return FileResponse(path, filename=filename, media_type=media_type)
+
+
 @router.post(
     "/{project_id}/documents/{document_id}/parse", response_model=JobResponse, status_code=202
 )

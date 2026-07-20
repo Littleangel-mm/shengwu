@@ -2,11 +2,15 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Query
+from fastapi.responses import FileResponse
 
 from app.api.deps import ActorId, DbSession
+from app.core.config import get_settings
 from app.schemas.common import ListResponse
 from app.schemas.workflow import SearchCreate, SearchResultReview, TaskAccepted
 from app.services.search import SearchService
+from app.services.search_export import SearchExportService
+from app.services.storage import LocalStorage
 
 router = APIRouter()
 
@@ -41,6 +45,16 @@ def list_search_results(
 ):
     items, total = SearchService(db).list_results(project_id, run_id, offset, limit)
     return ListResponse(items=items, total=total, offset=offset, limit=limit)
+
+
+@router.get("/{project_id}/search-runs/{run_id}/export.xlsx")
+def export_search_run(project_id: UUID, run_id: UUID, db: DbSession):
+    path = SearchExportService(db, LocalStorage(get_settings())).export_xlsx(project_id, run_id)
+    return FileResponse(
+        path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=path.name,
+    )
 
 
 @router.patch(

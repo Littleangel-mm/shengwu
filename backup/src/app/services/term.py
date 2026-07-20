@@ -7,6 +7,7 @@ from uuid import UUID
 
 import jieba
 from fastapi.encoders import jsonable_encoder
+from rapidfuzz import fuzz
 from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.orm import Session
 
@@ -49,6 +50,37 @@ STOPWORDS = {
     "using",
 }
 
+DEFAULT_TERM_CATEGORY_TEMPLATES: tuple[dict[str, str], ...] = (
+    {
+        "code": "process_parameters",
+        "name": "工艺参数",
+        "description": "发酵温度、发酵时间、pH、接种量等工艺过程控制参数",
+    },
+    {
+        "code": "chemical_indicators",
+        "name": "化学指标",
+        "description": "总酸、氨基酸态氮、还原糖等理化与化学成分指标",
+    },
+    {
+        "code": "sensory_evaluation",
+        "name": "感官评价",
+        "description": "色泽、香气、滋味、体态等感官评价指标",
+    },
+)
+
+SYNONYM_SIMILARITY_THRESHOLD = 85.0
+SYNONYM_MAX_TERMS = 2000
+SYNONYM_MAX_CLUSTERS = 50
+
+
+def _find_root(parent: dict[UUID, UUID], item: UUID) -> UUID:
+    root = item
+    while parent[root] != root:
+        root = parent[root]
+    while parent[item] != root:
+        parent[item], item = root, parent[item]
+    return root
+
 
 class TermService:
     def __init__(self, db: Session) -> None:
@@ -84,6 +116,157 @@ class TermService:
                 .order_by(categories.c.position, categories.c.name)
             ).mappings()
         ]
+
+    def apply_default_category_template(self, project_id: UUID) -> list[dict]:
+        categories = table(self.db, "term_categories")
+        existing_codes = set(
+            self.db.scalars(
+                select(categories.c.code).where(categories.c.project_id == project_id)
+            ).all()
+        )
+        created = False
+        for position, template in enumerate(DEFAULT_TERM_CATEGORY_TEMPLATES):
+            if template["code"] in existing_codes:
+                continue
+            self.db.execute(
+                insert(categories).values(
+                    project_id=project_id,
+                    code=template["code"],
+                    name=template["name"],
+                    description=template["description"],
+                    position=position,
+                    settings={},
+                )
+            )
+            created = True
+        if created:
+            self.db.commit()
+        return self.list_categories(project_id)
+
+    @staticmethod
+    def _normalize_similarity_text(value: str) -> str:
+        return re.sub(r"\s+", " ", value.casefold()).strip()
+
+    def suggest_synonyms(
+        self,
+        project_id: UUID,
+        threshold: float = SYNONYM_SIMILARITY_THRESHOLD,
+        max_terms: int = SYNONYM_MAX_TERMS,
+        max_clusters: int = SYNONYM_MAX_CLUSTERS,
+    ) -> list[dict[str, Any]]:
+        terms = table(self.db, "terms")
+        aliases = table(self.db, "term_aliases")
+        categories = table(self.db, "term_categories")
+        occurrences = table(self.db, "term_occurrences")
+        rows = (
+            self.db.execute(
+                select(
+                    terms.c.id,
+                    terms.c.canonical_name,
+                    terms.c.normalized_name,
+                    terms.c.category_id,
+                )
+                .where(terms.c.project_id == project_id, terms.c.deleted_at.is_(None))
+                .order_by(terms.c.canonical_name)
+                .limit(max_terms)
+            )
+            .mappings()
+            .all()
+        )
+        if len(rows) < 2:
+            return []
+        term_ids: list[UUID] = [row["id"] for row in rows]
+        variants: dict[UUID, set[str]] = {term_id: set() for term_id in term_ids}
+        for row in rows:
+            for value in (row["canonical_name"], row["normalized_name"]):
+                normalized = self._normalize_similarity_text(value or "")
+                if normalized:
+                    variants[row["id"]].add(normalized)
+        for alias in self.db.execute(
+            select(aliases.c.term_id, aliases.c.alias_text, aliases.c.normalized_alias).where(
+                aliases.c.term_id.in_(term_ids)
+            )
+        ).mappings():
+            for value in (alias["alias_text"], alias["normalized_alias"]):
+                normalized = self._normalize_similarity_text(value or "")
+                if normalized:
+                    variants[alias["term_id"]].add(normalized)
+        occurrence_counts: dict[UUID, int] = {
+            row["term_id"]: int(row["total"] or 0)
+            for row in self.db.execute(
+                select(
+                    occurrences.c.term_id,
+                    func.sum(occurrences.c.occurrence_count).label("total"),
+                )
+                .where(occurrences.c.term_id.in_(term_ids))
+                .group_by(occurrences.c.term_id)
+            ).mappings()
+        }
+        category_names: dict[UUID, str] = {
+            row["id"]: row["name"]
+            for row in self.db.execute(
+                select(categories.c.id, categories.c.name).where(
+                    categories.c.project_id == project_id
+                )
+            ).mappings()
+        }
+        info: dict[UUID, dict[str, Any]] = {
+            row["id"]: {
+                "id": row["id"],
+                "display_name": row["canonical_name"],
+                "category_id": row["category_id"],
+                "category": category_names.get(row["category_id"]),
+                "occurrence_count": occurrence_counts.get(row["id"], 0),
+            }
+            for row in rows
+        }
+        parent: dict[UUID, UUID] = {term_id: term_id for term_id in term_ids}
+        edges: list[tuple[UUID, UUID, float]] = []
+        for index, left in enumerate(term_ids):
+            for right in term_ids[index + 1 :]:
+                if variants[left] & variants[right]:
+                    score = 100.0
+                else:
+                    score = max(
+                        (
+                            float(fuzz.token_set_ratio(a, b))
+                            for a in variants[left]
+                            for b in variants[right]
+                        ),
+                        default=0.0,
+                    )
+                if score >= threshold:
+                    parent[_find_root(parent, left)] = _find_root(parent, right)
+                    edges.append((left, right, score))
+        members_by_root: dict[UUID, list[UUID]] = {}
+        for term_id in term_ids:
+            members_by_root.setdefault(_find_root(parent, term_id), []).append(term_id)
+        score_by_root: dict[UUID, float] = {}
+        for left, _right, score in edges:
+            root = _find_root(parent, left)
+            score_by_root[root] = max(score_by_root.get(root, 0.0), score)
+        clusters: list[dict[str, Any]] = []
+        for root, members in members_by_root.items():
+            if len(members) < 2:
+                continue
+            term_items = [info[member] for member in members]
+            suggested = min(
+                term_items,
+                key=lambda item: (
+                    -item["occurrence_count"],
+                    len(item["display_name"]),
+                    item["display_name"],
+                ),
+            )
+            clusters.append(
+                {
+                    "terms": term_items,
+                    "suggested_standard": suggested,
+                    "similarity": round(score_by_root.get(root, 0.0), 1),
+                }
+            )
+        clusters.sort(key=lambda cluster: (-len(cluster["terms"]), -cluster["similarity"]))
+        return clusters[:max_clusters]
 
     def update_category(
         self, project_id: UUID, category_id: UUID, payload: TermCategoryUpdate

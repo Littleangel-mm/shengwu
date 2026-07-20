@@ -1,5 +1,6 @@
 import {
   Activity,
+  Archive,
   ArrowLeft,
   ArrowRight,
   Atom,
@@ -617,6 +618,12 @@ function DashboardPage() {
     },
   })
 
+  const archive = useMutation({
+    mutationFn: ({ projectId, restore }: { projectId: string; restore: boolean }) =>
+      restore ? api.unarchiveProject(projectId) : api.archiveProject(projectId),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['projects'] }),
+  })
+
   const orgItems = organizations.data?.items || []
   const projectItems = projects.data?.items || []
 
@@ -641,7 +648,7 @@ function DashboardPage() {
         </div>
 
         {(organizations.isLoading || projects.isLoading) && <LoadingPane />}
-        <ErrorNotice error={organizations.error || projects.error} />
+        <ErrorNotice error={organizations.error || projects.error || archive.error} />
 
         {!projects.isLoading && projectItems.length === 0 && (
           <div className="empty-state glass">
@@ -665,12 +672,32 @@ function DashboardPage() {
               animate={{ opacity: 1, y: 0 }}
               transition={{ delay: index * 0.06 }}
             >
-              <Link className="project-card glass" to={`/app/projects/${project.id}/overview`}>
+              <Link
+                className={`project-card glass ${project.status === 'archived' ? 'archived' : ''}`}
+                to={`/app/projects/${project.id}/overview`}
+              >
                 <div className="project-card-top">
                   <span className="project-symbol">
                     <FlaskConical size={20} />
                   </span>
-                  <StatusPill value={project.status} />
+                  <span className="project-card-controls">
+                    <StatusPill value={project.status} />
+                    <button
+                      className="mini-button"
+                      title={project.status === 'archived' ? '恢复项目' : '归档项目'}
+                      disabled={archive.isPending}
+                      onClick={(event) => {
+                        event.preventDefault()
+                        event.stopPropagation()
+                        const restore = project.status === 'archived'
+                        if (restore || window.confirm(`归档项目「${project.name}」？归档后仍可随时恢复。`)) {
+                          archive.mutate({ projectId: project.id, restore })
+                        }
+                      }}
+                    >
+                      {project.status === 'archived' ? <RotateCcw size={13} /> : <Archive size={13} />}
+                    </button>
+                  </span>
                 </div>
                 <div>
                   <small>{project.research_domain || '综合研究'}</small>
@@ -1193,6 +1220,93 @@ function FigurePreview({
   return <img src={source} alt={alt} />
 }
 
+type PageHighlight = {
+  id: string
+  bbox: number[]
+  kind: 'block' | 'table' | 'figure'
+  label: string
+}
+
+function PageImageViewer({
+  projectId,
+  documentId,
+  pageNo,
+  pageWidth,
+  pageHeight,
+  highlights,
+  activeId,
+  onSelect,
+}: {
+  projectId: string
+  documentId: string
+  pageNo: number
+  pageWidth?: number | null
+  pageHeight?: number | null
+  highlights: PageHighlight[]
+  activeId?: string | null
+  onSelect: (id: string) => void
+}) {
+  const [source, setSource] = useState<string>()
+  const [failed, setFailed] = useState(false)
+
+  useEffect(() => {
+    let blobUrl = ''
+    let active = true
+    setSource(undefined)
+    setFailed(false)
+    api
+      .pageImageBlob(projectId, documentId, pageNo)
+      .then((blob) => {
+        if (!active) return
+        blobUrl = URL.createObjectURL(blob)
+        setSource(blobUrl)
+      })
+      .catch(() => active && setFailed(true))
+    return () => {
+      active = false
+      if (blobUrl) URL.revokeObjectURL(blobUrl)
+    }
+  }, [documentId, pageNo, projectId])
+
+  if (failed) {
+    return (
+      <div className="page-image-fallback">
+        该文献没有可渲染的 PDF 页面图像，请使用文本视图查看证据。
+      </div>
+    )
+  }
+  if (!source) return <LoadingPane label="正在渲染原文页面" />
+  const width = Number(pageWidth) || 0
+  const height = Number(pageHeight) || 0
+  return (
+    <div className="page-image-stage">
+      <img src={source} alt={`第 ${pageNo} 页原文`} />
+      {width > 0 &&
+        height > 0 &&
+        highlights
+          .filter((item) => item.bbox?.length === 4)
+          .map((item) => {
+            const [x0, y0, x1, y1] = item.bbox
+            return (
+              <button
+                key={item.id}
+                type="button"
+                className={`page-highlight ${item.kind} ${item.id === activeId ? 'active' : ''}`}
+                title={item.label}
+                style={{
+                  left: `${(Math.min(x0, x1) / width) * 100}%`,
+                  top: `${(Math.min(y0, y1) / height) * 100}%`,
+                  width: `${(Math.abs(x1 - x0) / width) * 100}%`,
+                  height: `${(Math.abs(y1 - y0) / height) * 100}%`,
+                }}
+                onClick={() => onSelect(item.id)}
+              />
+            )
+          })}
+    </div>
+  )
+}
+
 function DocumentDetailSection({
   projectId,
   documentId,
@@ -1204,6 +1318,8 @@ function DocumentDetailSection({
   const location = useLocation()
   const [error, setError] = useState<unknown>(null)
   const [activePage, setActivePage] = useState<number>()
+  const [viewMode, setViewMode] = useState<'text' | 'highlight'>('text')
+  const [activeEvidenceId, setActiveEvidenceId] = useState<string | null>(null)
   const detail = useQuery({
     queryKey: ['document', projectId, documentId],
     queryFn: () => api.documentDetail(projectId, documentId),
@@ -1324,13 +1440,81 @@ function DocumentDetailSection({
                 <h3>第 {selectedPage} 页</h3>
               </div>
               <div className="page-badges">
+                <div className="segment-tabs compact">
+                  <button className={viewMode === 'text' ? 'active' : ''} onClick={() => setViewMode('text')}>
+                    文本解析
+                  </button>
+                  <button
+                    className={viewMode === 'highlight' ? 'active' : ''}
+                    onClick={() => setViewMode('highlight')}
+                  >
+                    原文高亮
+                  </button>
+                </div>
                 <span>{page?.text_source === 'ocr_paddle' ? 'OCR 识别' : '内嵌文本'}</span>
                 {page?.ocr_confidence != null && (
                   <span>置信度 {Math.round(page.ocr_confidence * 100)}%</span>
                 )}
               </div>
             </div>
-            <div className="document-blocks">
+            {viewMode === 'highlight' && page && (
+              <>
+                <PageImageViewer
+                  projectId={projectId}
+                  documentId={documentId}
+                  pageNo={page.page_no}
+                  pageWidth={page.width}
+                  pageHeight={page.height}
+                  activeId={activeEvidenceId}
+                  onSelect={setActiveEvidenceId}
+                  highlights={[
+                    ...pageBlocks.map((block) => ({
+                      id: block.id,
+                      bbox: block.bbox || [],
+                      kind: 'block' as const,
+                      label: `正文块 ${block.sequence_no + 1}`,
+                    })),
+                    ...pageTables.map((table) => ({
+                      id: table.id,
+                      bbox: table.bbox || [],
+                      kind: 'table' as const,
+                      label: table.title || table.table_no || '表格',
+                    })),
+                    ...pageFigures.map((figure) => ({
+                      id: figure.id,
+                      bbox: figure.bbox || [],
+                      kind: 'figure' as const,
+                      label: figure.caption || figure.figure_no || '图片',
+                    })),
+                  ]}
+                />
+                {activeEvidenceId && (
+                  <div className="highlight-detail">
+                    {(() => {
+                      const block = pageBlocks.find((item) => item.id === activeEvidenceId)
+                      if (block) {
+                        return (
+                          <>
+                            <small>正文块 {block.sequence_no + 1} · {block.block_type}</small>
+                            <p>{block.content_text}</p>
+                          </>
+                        )
+                      }
+                      const table = pageTables.find((item) => item.id === activeEvidenceId)
+                      if (table) {
+                        return <small>表格：{table.title || table.table_no}（表格内容见文本解析视图）</small>
+                      }
+                      const figure = pageFigures.find((item) => item.id === activeEvidenceId)
+                      if (figure) {
+                        return <small>图片：{figure.caption || figure.title || figure.figure_no}</small>
+                      }
+                      return null
+                    })()}
+                  </div>
+                )}
+              </>
+            )}
+            <div className="document-blocks" hidden={viewMode !== 'text'}>
               {pageBlocks.length ? (
                 pageBlocks.map((block) => (
                   <article className={`document-block ${block.block_type}`} key={block.id}>
@@ -1354,7 +1538,7 @@ function DocumentDetailSection({
                 <EmptyInline text="本页没有可显示的正文" />
               )}
             </div>
-            {pageTables.map((table) => {
+            {viewMode === 'text' && pageTables.map((table) => {
               const rows = Array.from({ length: Math.min(table.row_count, 30) }, () =>
                 Array.from({ length: Math.min(table.column_count, 12) }, () => ''),
               )
@@ -1383,7 +1567,7 @@ function DocumentDetailSection({
                 </section>
               )
             })}
-            {pageFigures.length > 0 && (
+            {viewMode === 'text' && pageFigures.length > 0 && (
               <div className="figure-grid">
                 {pageFigures.map((figure) => (
                   <figure key={figure.id}>
@@ -1622,6 +1806,14 @@ function SearchSection({ projectId }: { projectId: string }) {
         queryKey: ['search-results', projectId, selectedRunId],
       }),
   })
+  const exportPackage = useMutation({
+    mutationFn: () =>
+      api.exportSearchPackage(
+        projectId,
+        selectedRunId,
+        `检索与词元确认包-${selectedRun?.name || selectedRunId.slice(0, 8)}`,
+      ),
+  })
   const modeLabels: Record<SearchMode, string> = {
     exact: '精确检索',
     fuzzy: '模糊检索',
@@ -1772,7 +1964,20 @@ function SearchSection({ projectId }: { projectId: string }) {
               ))}
             </div>
           </div>
-          <ErrorNotice error={results.error || review.error} />
+          {selectedRun?.status === 'completed' && (
+            <div className="export-bar">
+              <button
+                className="button button-secondary"
+                disabled={exportPackage.isPending}
+                onClick={() => exportPackage.mutate()}
+              >
+                {exportPackage.isPending ? <LoaderCircle className="spin" size={15} /> : <Download size={15} />}
+                导出检索与词元确认包（Excel）
+              </button>
+              <small>包含 documents、search_results、figure_table_results、token_candidates 四个工作表</small>
+            </div>
+          )}
+          <ErrorNotice error={results.error || review.error || exportPackage.error} />
           {results.isLoading ? (
             <LoadingPane label="正在读取检索结果" />
           ) : selectedRun && ['queued', 'running'].includes(selectedRun.status) ? (
@@ -1964,6 +2169,26 @@ function TermsSection({ projectId }: { projectId: string }) {
     mutationFn: (runId: string) => api.discoverTerms(projectId, runId),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['jobs', projectId] }),
   })
+  const applyTemplate = useMutation({
+    mutationFn: () => api.applyDefaultTermTemplate(projectId),
+    onSuccess: refreshTerms,
+  })
+  const [showSuggestions, setShowSuggestions] = useState(false)
+  const suggestions = useQuery({
+    queryKey: ['synonym-suggestions', projectId],
+    queryFn: () => api.synonymSuggestions(projectId),
+    enabled: showSuggestions,
+  })
+  const mergeCluster = useMutation({
+    mutationFn: ({ target, sources }: { target: string; sources: string[] }) =>
+      api.mergeTerms(projectId, target, sources, '同义词聚类建议人工确认合并'),
+    onSuccess: async () => {
+      await Promise.all([
+        refreshTerms(),
+        queryClient.invalidateQueries({ queryKey: ['synonym-suggestions', projectId] }),
+      ])
+    },
+  })
   const saveSchema = useMutation({
     mutationFn: () => {
       const payload = {
@@ -2019,6 +2244,9 @@ function TermsSection({ projectId }: { projectId: string }) {
     merge.error ||
     split.error ||
     discover.error ||
+    applyTemplate.error ||
+    suggestions.error ||
+    mergeCluster.error ||
     saveSchema.error ||
     freezeSchema.error
 
@@ -2089,7 +2317,75 @@ function TermsSection({ projectId }: { projectId: string }) {
                 <option value={run.id} key={run.id}>{run.name || run.terms.join('、')}</option>
               ))}
             </select>
+            <button
+              className="button button-secondary"
+              disabled={applyTemplate.isPending}
+              onClick={() => applyTemplate.mutate()}
+              title="创建工艺参数、化学指标、感官评价三个默认分类"
+            >
+              <Layers3 size={15} /> 应用默认模板
+            </button>
+            <button
+              className={`button button-secondary ${showSuggestions ? 'active' : ''}`}
+              onClick={() => setShowSuggestions((value) => !value)}
+            >
+              <GitMerge size={15} /> 同义词建议
+            </button>
           </div>
+          {showSuggestions && (
+            <section className="panel glass synonym-panel">
+              <PanelHeading
+                eyebrow="同义词 / 近义词聚类建议"
+                title={suggestions.isLoading ? '正在分析术语相似度' : `${suggestions.data?.length || 0} 组建议`}
+              />
+              <p className="panel-note">系统仅提出建议，未经人工确认不会自动合并任何术语。</p>
+              {suggestions.isLoading ? (
+                <LoadingPane />
+              ) : suggestions.data?.length ? (
+                <div className="synonym-cluster-list">
+                  {suggestions.data.map((cluster, index) => (
+                    <article key={`${cluster.suggested_standard.id}-${index}`}>
+                      <div className="cluster-terms">
+                        {cluster.terms.map((item) => (
+                          <span
+                            key={item.id}
+                            className={item.id === cluster.suggested_standard.id ? 'standard' : ''}
+                          >
+                            {item.display_name}
+                            {item.occurrence_count != null ? ` ×${item.occurrence_count}` : ''}
+                          </span>
+                        ))}
+                      </div>
+                      <div className="cluster-meta">
+                        <small>建议标准词：{cluster.suggested_standard.display_name} · 相似度 {Math.round(cluster.similarity)}%</small>
+                        <button
+                          className="mini-button confirm"
+                          disabled={mergeCluster.isPending}
+                          onClick={() => {
+                            const sources = cluster.terms
+                              .map((item) => item.id)
+                              .filter((id) => id !== cluster.suggested_standard.id)
+                            if (
+                              sources.length &&
+                              window.confirm(
+                                `将 ${sources.length} 个术语合并到「${cluster.suggested_standard.display_name}」？别名会自动保留。`,
+                              )
+                            ) {
+                              mergeCluster.mutate({ target: cluster.suggested_standard.id, sources })
+                            }
+                          }}
+                        >
+                          <GitMerge size={13} /> 确认合并
+                        </button>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              ) : (
+                <EmptyInline text="当前术语中没有发现相似度足够高的同义词组" />
+              )}
+            </section>
+          )}
           {selectedIds.length >= 2 && (
             <div className="selection-bar glass">
               <span>已选择 {selectedIds.length} 个术语</span>

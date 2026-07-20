@@ -100,6 +100,7 @@ export type DocumentDetail = {
     title?: string | null
     row_count: number
     column_count: number
+    bbox?: number[] | null
     confidence?: number | null
     cells: Array<{
       id: string
@@ -118,6 +119,7 @@ export type DocumentDetail = {
     title?: string | null
     caption?: string | null
     figure_type: string
+    bbox?: number[] | null
     image_file_id?: string | null
     axis_metadata: Record<string, unknown>
     legend_metadata: Record<string, unknown>
@@ -429,6 +431,20 @@ export type ReportItem = GenericRecord & {
   created_at: string
 }
 
+export type SynonymClusterTerm = {
+  id: string
+  display_name: string
+  category_id?: string | null
+  category_name?: string | null
+  occurrence_count?: number | null
+}
+
+export type SynonymCluster = {
+  suggested_standard: SynonymClusterTerm
+  similarity: number
+  terms: SynonymClusterTerm[]
+}
+
 export type MemberItem = {
   user_id: string
   email: string
@@ -555,6 +571,10 @@ export const api = {
     description?: string
     research_domain?: string
   }) => request<Project>('/projects', { method: 'POST', body: json(payload) }),
+  archiveProject: (projectId: string) =>
+    request<Project>(`/projects/${projectId}/archive`, { method: 'POST' }),
+  unarchiveProject: (projectId: string) =>
+    request<Project>(`/projects/${projectId}/unarchive`, { method: 'POST' }),
   projectMembership: (projectId: string) =>
     request<ProjectMembership>(`/projects/${projectId}/membership`),
   projectMembers: (projectId: string) =>
@@ -613,6 +633,8 @@ export const api = {
   },
   figureBlob: (projectId: string, documentId: string, figureId: string) =>
     authorizedBlob(`/projects/${projectId}/documents/${documentId}/figures/${figureId}/image`),
+  pageImageBlob: (projectId: string, documentId: string, pageNo: number) =>
+    authorizedBlob(`/projects/${projectId}/documents/${documentId}/pages/${pageNo}/image`),
   uploadDocuments: (projectId: string, files: FileList | File[]) => {
     const form = new FormData()
     Array.from(files).forEach((file) => form.append('files', file))
@@ -662,6 +684,11 @@ export const api = {
       `/projects/${projectId}/search-runs/${runId}/results/${resultId}`,
       { method: 'PATCH', body: json(payload) },
     ),
+  exportSearchPackage: (projectId: string, runId: string, name: string) =>
+    downloadBlob(
+      `/projects/${projectId}/search-runs/${runId}/export.xlsx`,
+      `${name || 'search-package'}.xlsx`,
+    ),
   termCategories: (projectId: string) =>
     request<TermCategory[]>(`/projects/${projectId}/term-categories`),
   createTermCategory: (projectId: string, payload: { code: string; name: string; description?: string }) =>
@@ -676,6 +703,12 @@ export const api = {
     }),
   deleteTermCategory: (projectId: string, categoryId: string) =>
     request<void>(`/projects/${projectId}/term-categories/${categoryId}`, { method: 'DELETE' }),
+  applyDefaultTermTemplate: (projectId: string) =>
+    request<TermCategory[]>(`/projects/${projectId}/term-categories/apply-default-template`, {
+      method: 'POST',
+    }),
+  synonymSuggestions: (projectId: string) =>
+    request<SynonymCluster[]>(`/projects/${projectId}/terms/synonym-suggestions`),
   terms: (projectId: string, categoryId?: string, status?: string) => {
     const params = new URLSearchParams({ limit: '500' })
     if (categoryId) params.set('category_id', categoryId)

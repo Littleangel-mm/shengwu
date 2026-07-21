@@ -40,8 +40,8 @@ class Settings(BaseSettings):
     db_max_overflow: int = Field(default=20, ge=0, le=200)
 
     storage_root: Path = Path("data")
-    max_upload_size_mb: int = Field(default=200, ge=1, le=2048)
-    allowed_extensions: str = "pdf,docx,txt,md,xlsx,xls,zip"
+    max_upload_size_mb: int = Field(default=1024, ge=1, le=4096)
+    allowed_extensions: str = "pdf,docx,txt,md,csv,xlsx,xls,zip"
     zip_max_entries: int = Field(default=500, ge=1, le=5000)
     zip_max_uncompressed_mb: int = Field(default=1000, ge=1, le=10240)
     zip_max_compression_ratio: float = Field(default=100, ge=1, le=10000)

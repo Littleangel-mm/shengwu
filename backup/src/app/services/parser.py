@@ -261,6 +261,8 @@ class DocumentParser:
             summary = self._parse_docx(version, project, path, progress)
         elif extension in {"txt", "md"}:
             summary = self._parse_text(version, path, progress)
+        elif extension == "csv":
+            summary = self._parse_csv(version, path, progress)
         elif extension in {"xlsx", "xls"}:
             if extension == "xls":
                 raise AppError(
@@ -820,6 +822,80 @@ class DocumentParser:
             "blocks": block_count,
             "tables": 0,
             "cells": 0,
+            "figures": 0,
+            "requires_ocr": False,
+        }
+
+    def _parse_csv(
+        self, version: DocumentVersion, path: Path, progress: ProgressCallback
+    ) -> dict[str, Any]:
+        import csv
+
+        raw = path.read_bytes().decode("utf-8-sig", errors="replace")
+        sample = raw[:4096]
+        try:
+            dialect: type[csv.Dialect] | csv.Dialect = csv.Sniffer().sniff(
+                sample, delimiters=",;\t|"
+            )
+        except csv.Error:
+            dialect = csv.excel
+        rows = [
+            [str(cell).strip() for cell in row]
+            for row in csv.reader(raw.splitlines(), dialect)
+            if any(str(cell).strip() for cell in row)
+        ]
+        progress(40, "parsed_csv_rows")
+        text = "\n".join("\t".join(row) for row in rows)
+        page_id = self._insert_page(
+            version.id,
+            1,
+            text_content=text,
+            text_source="spreadsheet",
+            metadata={"row_count": len(rows)},
+        )
+        self._insert_blocks(version.id, page_id, [{"text": text, "type": "table_text"}])
+        tables_table = table(self.db, "document_tables")
+        cells_table = table(self.db, "document_table_cells")
+        total_cells = 0
+        if rows:
+            table_id = self.db.execute(
+                insert(tables_table)
+                .values(
+                    document_version_id=version.id,
+                    page_id=page_id,
+                    table_no="1",
+                    title=path.stem,
+                    row_count=len(rows),
+                    column_count=max((len(row) for row in rows), default=0),
+                    structured_data={"rows": rows},
+                    confidence=1,
+                )
+                .returning(tables_table.c.id)
+            ).scalar_one()
+            values = [
+                {
+                    "table_id": table_id,
+                    "row_index": row_no,
+                    "column_index": col_no,
+                    "cell_role": "header" if row_no == 0 else "data",
+                    "raw_text": value,
+                    "normalized_text": value,
+                    "style": {},
+                    "confidence": 1,
+                }
+                for row_no, row in enumerate(rows)
+                for col_no, value in enumerate(row)
+            ]
+            if values:
+                self.db.execute(insert(cells_table), values)
+                total_cells = len(values)
+        self.db.commit()
+        progress(95, "parsed_csv")
+        return {
+            "pages": 1,
+            "blocks": 1,
+            "tables": 1 if rows else 0,
+            "cells": total_cells,
             "figures": 0,
             "requires_ocr": False,
         }

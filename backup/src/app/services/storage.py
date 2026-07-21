@@ -87,7 +87,7 @@ class LocalStorage:
             )
         if extension == "xls" and not head.startswith(bytes.fromhex("D0CF11E0")):
             raise AppError(code="invalid_file_signature", message="XLS 文件头无效", status_code=415)
-        if extension in {"txt", "md"} and b"\x00" in head:
+        if extension in {"txt", "md", "csv"} and b"\x00" in head:
             raise AppError(
                 code="invalid_text_file", message="文本文件包含二进制内容", status_code=415
             )

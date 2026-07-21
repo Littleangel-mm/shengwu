@@ -74,6 +74,7 @@ import {
   type MLModel,
   type PrismaExclusionReason,
   type PrismaFlowData,
+  type ReportLineage,
   type Project,
   type SearchMode,
   type SearchRun,
@@ -1683,14 +1684,14 @@ function DocumentsSection({ projectId }: { projectId: string }) {
         <input
           type="file"
           multiple
-          accept=".pdf,.docx,.xlsx,.xls,.txt,.md,.zip"
+          accept=".pdf,.docx,.xlsx,.xls,.csv,.txt,.md,.zip"
           onChange={(event) => event.target.files?.length && upload.mutate(event.target.files)}
         />
         <span className="upload-icon">
           {upload.isPending ? <LoaderCircle className="spin" /> : <Upload />}
         </span>
         <strong>{upload.isPending ? '正在安全上传…' : '拖放或选择研究文献'}</strong>
-        <small>PDF · DOCX · XLSX · TXT · MD · ZIP，单批文件将自动创建解析任务</small>
+        <small>PDF · DOCX · XLSX · CSV · TXT · MD · ZIP，单批文件将自动创建解析任务</small>
       </label>
       <ErrorNotice error={error || upload.error} />
       <div className="content-grid">
@@ -4066,6 +4067,7 @@ function ReportsSection({ projectId }: { projectId: string }) {
   const [mlRunId, setMlRunId] = useState('')
   const [optimizationRunId, setOptimizationRunId] = useState('')
   const [selectedJob, setSelectedJob] = useState<JobItem | null>(null)
+  const [lineageReportId, setLineageReportId] = useState<string | null>(null)
   const reports = useQuery({
     queryKey: ['reports', projectId],
     queryFn: () => api.reports(projectId),
@@ -4129,6 +4131,11 @@ function ReportsSection({ projectId }: { projectId: string }) {
                   const reportJob = jobs.data?.items.find((job) => job.id === report.job_id)
                   return reportJob ? <button className="mini-button" onClick={() => setSelectedJob(reportJob)}>日志</button> : null
                 })()}
+                {report.status === 'completed' && (
+                  <button className="mini-button" onClick={() => setLineageReportId(report.id)}>
+                    <Network size={14} /> 血缘
+                  </button>
+                )}
                 <button
                   className="mini-button"
                   onClick={() =>
@@ -4145,7 +4152,93 @@ function ReportsSection({ projectId }: { projectId: string }) {
         )}
       </section>
       <AnimatePresence>{selectedJob && <TaskLogModal projectId={projectId} job={selectedJob} onClose={() => setSelectedJob(null)} />}</AnimatePresence>
+      <AnimatePresence>{lineageReportId && <LineageModal projectId={projectId} reportId={lineageReportId} onClose={() => setLineageReportId(null)} />}</AnimatePresence>
     </div>
+  )
+}
+
+function LineageModal({ projectId, reportId, onClose }: { projectId: string; reportId: string; onClose: () => void }) {
+  const lineage = useQuery({
+    queryKey: ['report-lineage', projectId, reportId],
+    queryFn: () => api.reportLineage(projectId, reportId),
+  })
+  const nodeName = (node: ReportLineage['report']) =>
+    node ? String(node.name ?? node.title ?? node.id ?? '—') : '（缺）'
+  const data = lineage.data
+  const stages: { label: string; node: ReportLineage['report'] }[] = data
+    ? [
+        { label: '检索运行', node: data.search_run },
+        { label: '字段方案', node: data.field_schema },
+        { label: '抽取运行', node: data.extraction_run },
+        { label: '数据集版本', node: data.dataset_version },
+        { label: '模型运行', node: data.ml_run },
+        { label: '优化运行', node: data.optimization_run },
+        { label: '研究报告', node: data.report },
+      ]
+    : []
+  return (
+    <motion.div className="modal-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={onClose}>
+      <motion.div className="modal-card glass lineage-modal" initial={{ y: 24, opacity: 0 }} animate={{ y: 0, opacity: 1 }} exit={{ y: 24, opacity: 0 }} onClick={(event) => event.stopPropagation()}>
+        <div className="modal-head">
+          <div>
+            <span className="eyebrow">来源血缘</span>
+            <h3>报告数据链路</h3>
+          </div>
+          <button className="icon-button" onClick={onClose}><X size={18} /></button>
+        </div>
+        {lineage.isLoading ? (
+          <LoadingPane />
+        ) : data ? (
+          <div className="lineage-body">
+            <div className="lineage-chain">
+              {stages.filter((stage) => stage.node).map((stage, index, arr) => (
+                <div className="lineage-step" key={stage.label}>
+                  <div className="lineage-node-card">
+                    <small>{stage.label}</small>
+                    <strong>{nodeName(stage.node)}</strong>
+                    {stage.node?.status ? <span className="lineage-status">{String(stage.node.status)}</span> : null}
+                  </div>
+                  {index < arr.length - 1 && <span className="lineage-connector">→</span>}
+                </div>
+              ))}
+            </div>
+            <div className="lineage-facts">
+              <p><strong>纳入文献：</strong>{data.source_document_count} 篇 · 输入文件 {data.source_files.length} 个</p>
+              {data.ml_models.length > 0 && (
+                <p><strong>模型：</strong>{data.ml_models.map((m) => `${String(m.display_name)}${m.is_selected ? '（入选）' : ''}`).join('、')}</p>
+              )}
+            </div>
+            <div className="panel-heading"><span>完整性校验</span><h3>Hash 链</h3></div>
+            <div className="lineage-hash">
+              {data.hash_chain.length ? data.hash_chain.map((item) => (
+                <div className="lineage-hash-row" key={item.stage}>
+                  <span>{item.stage}</span>
+                  <code>{Array.isArray(item.sha256) ? item.sha256.map((h) => h.slice(0, 16)).join(', ') + '…' : `${item.sha256.slice(0, 24)}…`}</code>
+                </div>
+              )) : <EmptyInline text="尚无 hash 记录" />}
+            </div>
+            {data.source_files.length > 0 && (
+              <>
+                <div className="panel-heading"><span>原始文件</span><h3>输入来源</h3></div>
+                <div className="record-list compact">
+                  {data.source_files.slice(0, 30).map((file, index) => (
+                    <div className="record-row" key={index}>
+                      <span className="record-icon"><FileText size={15} /></span>
+                      <div>
+                        <strong>{file.title || file.original_name || '未命名文件'}</strong>
+                        <small>{file.extension?.toUpperCase()} · {file.sha256 ? `${file.sha256.slice(0, 16)}…` : '无哈希'}</small>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
+        ) : (
+          <ErrorNotice error={lineage.error} />
+        )}
+      </motion.div>
+    </motion.div>
   )
 }
 

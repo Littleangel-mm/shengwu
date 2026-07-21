@@ -3807,3 +3807,109 @@ select option {
   line-height: 1;
 }
 
+/* Lineage modal */
+.modal-card {
+  width: min(760px, 100%);
+  max-height: 86vh;
+  overflow-y: auto;
+  border-radius: 22px;
+  padding: 26px 28px;
+  background: rgba(20, 22, 25, 0.96);
+}
+
+.modal-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+
+.modal-head h3 {
+  margin-top: 4px;
+  font-size: 20px;
+  font-weight: 500;
+}
+
+.lineage-body {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.lineage-chain {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.lineage-step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.lineage-node-card {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 12px;
+  min-width: 120px;
+  border: 1px solid rgba(198, 168, 106, 0.35);
+  border-radius: 12px;
+  background: rgba(198, 168, 106, 0.06);
+}
+
+.lineage-node-card small {
+  color: var(--gold);
+  font-size: 11px;
+}
+
+.lineage-node-card strong {
+  font-size: 13px;
+  word-break: break-all;
+}
+
+.lineage-status {
+  font-size: 11px;
+  color: var(--text-soft);
+}
+
+.lineage-connector {
+  color: rgba(198, 168, 106, 0.7);
+  font-size: 16px;
+}
+
+.lineage-facts p {
+  margin: 2px 0;
+  color: var(--text-soft);
+  font-size: 13px;
+}
+
+.lineage-hash {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.lineage-hash-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.lineage-hash-row span {
+  color: var(--gold);
+  font-size: 12px;
+}
+
+.lineage-hash-row code {
+  font-size: 12px;
+  color: var(--text-soft);
+  word-break: break-all;
+}
+

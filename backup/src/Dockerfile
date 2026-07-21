@@ -15,9 +15,11 @@ WORKDIR /srv/app
 
 # 先复制依赖声明与应用包，利用构建缓存
 COPY pyproject.toml ./
+# requirements.lock 作为版本约束（constraints），复现已测试的依赖版本
+COPY requirements.lock ./
 COPY app ./app
 # alembic 用于容器内执行数据库迁移（pyproject 依赖中未声明）
-RUN pip install . alembic
+RUN pip install -c requirements.lock . alembic
 
 # 迁移与运维脚本
 COPY alembic.ini ./

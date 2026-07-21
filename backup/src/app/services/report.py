@@ -538,7 +538,7 @@ class ReportService:
                 )
                 algorithms = sorted(
                     {
-                        str(model.get("algorithm") or model.get("display_name"))
+                        str(model.get("algorithm_code") or model.get("display_name"))
                         for model in model_rows
                     }
                 )
@@ -617,7 +617,7 @@ class ReportService:
                     document.add_heading("模型结果与公式", level=2)
                     document.add_paragraph(
                         f"入选模型：{selected_model['display_name']}"
-                        f"（算法：{selected_model.get('algorithm') or '未标注'}）。"
+                        f"（算法：{selected_model.get('algorithm_code') or '未标注'}）。"
                     )
                     selected_metrics = (
                         self.db.execute(

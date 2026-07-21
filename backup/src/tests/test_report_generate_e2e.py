@@ -174,3 +174,126 @@ def test_report_prisma_placeholder_when_counts_missing() -> None:
     texts = _render(enable_prisma=True, with_prisma_counts=False)
     joined = "\n".join(texts)
     assert "尚未录入筛选计数" in joined
+
+
+def test_csv_document_parses_into_table_cells() -> None:
+    import hashlib
+
+    from sqlalchemy import delete as sa_delete
+    from sqlalchemy import select
+
+    from app.core.config import get_settings
+    from app.db.session import SessionLocal
+    from app.db.tables import table
+    from app.models import (
+        Document,
+        DocumentVersion,
+        Organization,
+        Project,
+        StoredFile,
+    )
+    from app.services.parser import DocumentParser
+    from app.services.storage import LocalStorage
+
+    db = SessionLocal()
+    org = None
+    try:
+        settings = get_settings()
+        storage = LocalStorage(settings)
+        storage.ensure_root()
+        suffix = uuid4().hex[:10]
+        org = Organization(name=f"CSV Org {suffix}", slug=f"csv-org-{suffix}")
+        db.add(org)
+        db.flush()
+        project = Project(
+            organization_id=org.id, name="CSV Project", slug=f"csv-proj-{suffix}"
+        )
+        db.add(project)
+        db.flush()
+        content = b"temperature,yield\n30,0.82\n45,0.91\n"
+        key = f"uploads/test/{suffix}.csv"
+        destination = storage.path_for_key(key)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(content)
+        stored = StoredFile(
+            organization_id=org.id,
+            project_id=project.id,
+            storage_provider="local",
+            storage_key=key,
+            original_name="data.csv",
+            safe_name=f"{suffix}.csv",
+            extension="csv",
+            media_type="text/csv",
+            byte_size=len(content),
+            sha256=hashlib.sha256(content).hexdigest(),
+            purpose="upload",
+            security_status="clean",
+        )
+        db.add(stored)
+        db.flush()
+        document = Document(project_id=project.id, title="CSV 数据")
+        db.add(document)
+        db.flush()
+        version = DocumentVersion(
+            document_id=document.id, version_no=1, source_file_id=stored.id
+        )
+        db.add(version)
+        db.commit()
+
+        summary = DocumentParser(db, storage).parse(version.id, lambda *_: None)
+        assert summary["tables"] == 1
+        assert summary["cells"] == 6
+
+        tables_table = table(db, "document_tables")
+        cells_table = table(db, "document_table_cells")
+        table_id = db.scalar(
+            select(tables_table.c.id).where(
+                tables_table.c.document_version_id == version.id
+            )
+        )
+        header = db.scalar(
+            select(cells_table.c.raw_text).where(
+                cells_table.c.table_id == table_id,
+                cells_table.c.row_index == 0,
+                cells_table.c.column_index == 0,
+            )
+        )
+        assert header == "temperature"
+    finally:
+        if org is not None:
+            # 先删文献（级联清理版本），再删组织，避开 source_file_id 的 RESTRICT。
+            documents = table(db, "documents")
+            organizations = table(db, "organizations")
+            db.execute(sa_delete(documents).where(documents.c.project_id == project.id))
+            db.execute(sa_delete(organizations).where(organizations.c.id == org.id))
+            db.commit()
+        db.close()
+
+
+def test_report_lineage_aggregates_chain() -> None:
+    from app.db.session import SessionLocal
+    from app.db.tables import table
+    from app.services.lineage import LineageService
+
+    db = SessionLocal()
+    org_id = None
+    try:
+        org_id, project_id, report_id = _seed_minimal_report(
+            db, enable_prisma=False, with_prisma_counts=False
+        )
+        lineage = LineageService(db).report_lineage(project_id, report_id)
+        assert lineage["report"]["title"] == "端到端测试报告"
+        assert lineage["dataset_version"]["content_sha256"] == "0" * 64
+        assert lineage["ml_run"] is None
+        assert lineage["ml_models"] == []
+        assert isinstance(lineage["hash_chain"], list)
+        stages = {item["stage"] for item in lineage["hash_chain"]}
+        assert "冻结数据集" in stages
+    finally:
+        if org_id is not None:
+            organizations = table(db, "organizations")
+            from sqlalchemy import delete
+
+            db.execute(delete(organizations).where(organizations.c.id == org_id))
+            db.commit()
+        db.close()

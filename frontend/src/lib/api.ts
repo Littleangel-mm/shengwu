@@ -50,6 +50,29 @@ export type PrismaFlow = {
   exists: boolean
 }
 
+export type LineageNode = Record<string, unknown> | null
+
+export type ReportLineage = {
+  report: LineageNode
+  search_run: LineageNode
+  field_schema: LineageNode
+  extraction_run: LineageNode
+  dataset: LineageNode
+  dataset_version: LineageNode
+  ml_run: LineageNode
+  ml_models: Record<string, unknown>[]
+  optimization_run: LineageNode
+  source_document_count: number
+  source_files: {
+    title?: string | null
+    original_name?: string | null
+    extension?: string | null
+    byte_size?: number | null
+    sha256?: string | null
+  }[]
+  hash_chain: { stage: string; sha256: string | string[] }[]
+}
+
 export type TokenResponse = {
   access_token: string
   expires_at: string
@@ -1086,6 +1109,8 @@ export const api = {
     }),
   report: (projectId: string, reportId: string) =>
     request<ReportItem>(`/projects/${projectId}/reports/${reportId}`),
+  reportLineage: (projectId: string, reportId: string) =>
+    request<ReportLineage>(`/projects/${projectId}/reports/${reportId}/lineage`),
   downloadReport: async (projectId: string, reportId: string, title: string) => {
     const headers = new Headers()
     const token = session.getToken()

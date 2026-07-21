@@ -8,6 +8,7 @@ from app.api.deps import ActorId, DbSession
 from app.core.config import get_settings
 from app.schemas.report import ReportCreate
 from app.schemas.workflow import TaskAccepted
+from app.services.lineage import LineageService
 from app.services.report import ReportService
 from app.services.storage import LocalStorage
 
@@ -31,6 +32,11 @@ def list_reports(project_id: UUID, db: DbSession):
 @router.get("/{project_id}/reports/{report_id}", response_model=dict[str, Any])
 def get_report(project_id: UUID, report_id: UUID, db: DbSession):
     return service(db).get(project_id, report_id)
+
+
+@router.get("/{project_id}/reports/{report_id}/lineage", response_model=dict[str, Any])
+def get_report_lineage(project_id: UUID, report_id: UUID, db: DbSession):
+    return LineageService(db).report_lineage(project_id, report_id)
 
 
 @router.get("/{project_id}/reports/{report_id}/download")

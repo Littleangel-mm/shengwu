@@ -1558,7 +1558,7 @@ function DocumentDetailSection({
                       }
                       return null
                     })()}
-                  </div>
+        </div>
                 )}
               </>
             )}
@@ -1710,7 +1710,7 @@ function DocumentsSection({ projectId }: { projectId: string }) {
                   <span className="record-icon">
                     <FileText size={17} />
                   </span>
-                  <div>
+        <div>
                     <strong>{document.title || '未命名文献'}</strong>
                     <small>
                       {document.document_type} · {new Date(document.created_at).toLocaleDateString('zh-CN')}
@@ -1999,7 +1999,7 @@ function SearchSection({ projectId }: { projectId: string }) {
                   {selectedRun.logic_operator === 'AND' ? ' 全部关键词' : ' 任一关键词'}
                 </p>
               )}
-            </div>
+        </div>
             <div className="review-filters">
               {(['all', 'pending', 'confirmed', 'excluded'] as const).map((filter) => (
                 <button
@@ -3091,14 +3091,14 @@ function ExtractionSection({ projectId }: { projectId: string }) {
                 <option value="doubtful">标疑</option>
                 <option value="excluded">已排除</option>
               </select>
-              <button
-                type="button"
+        <button
+          type="button"
                 className={`button button-secondary ${showQuality ? 'active' : ''}`}
                 disabled={!selectedRunId}
                 onClick={() => setShowQuality((value) => !value)}
-              >
+        >
                 <ShieldCheck size={15} /> 质量报告
-              </button>
+        </button>
             </div>
           </div>
           {showQuality && selectedRunId && (
@@ -3139,7 +3139,7 @@ function ExtractionSection({ projectId }: { projectId: string }) {
               ))}
             </div>
           ) : <EmptyInline text={selectedRunId ? '暂无符合筛选条件的抽取记录' : '请选择抽取运行'} />}
-        </section>
+      </section>
       </div>
     </div>
   )
@@ -3973,7 +3973,7 @@ function PrismaSection({ projectId }: { projectId: string }) {
                 >
                   <Trash2 size={14} />
                 </button>
-              </div>
+        </div>
             ))}
             <button
               type="button"
@@ -4007,7 +4007,7 @@ function PrismaSection({ projectId }: { projectId: string }) {
         <section className="panel glass prisma-diagram">
           <PanelHeading eyebrow="PRISMA 2020" title="流程图预览" />
           <PrismaFlowDiagram data={form} />
-        </section>
+      </section>
       </div>
     </div>
   )
